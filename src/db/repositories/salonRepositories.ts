@@ -62,7 +62,6 @@ import {
   buildDefaultSettings,
   buildSystemCategories,
 } from '../seed'
-import { buildFreshBarberCatalog } from '../freshBarberCatalog'
 import type { IRepository } from './types'
 
 function makeId(prefix: string): string {
@@ -386,59 +385,6 @@ export class SalonRepositoryHub {
     return { removedRecords, salonCleaned }
   }
 
-  /**
-   * Initialise la base locale si elle est vierge, et garantit de façon persistante
-   * qu'aucune donnée fictive ne subsiste dès lors qu'une base ou un compte réel existe.
-   */
-  private async seedFreshBarberCatalogIfNeeded(): Promise<void> {
-    const currentSettings = await this.database.settings.get('default')
-    if (currentSettings?.freshBarberCatalogSeededAt) return
-
-    const nowIso = new Date().toISOString()
-    const catalog = buildFreshBarberCatalog(nowIso)
-    await this.database.transaction(
-      'rw',
-      [this.database.categories, this.database.services, this.database.settings],
-      async () => {
-        const settings = await this.database.settings.get('default')
-        if (settings?.freshBarberCatalogSeededAt) return
-
-        const existingCategories = await this.database.categories.toArray()
-        const categoryCodes = new Set(
-          existingCategories
-            .filter((category) => category.scope === 'service')
-            .map((category) => category.code),
-        )
-        const categoriesToAdd = catalog.categories.filter(
-          (category) => !categoryCodes.has(category.code),
-        )
-        if (categoriesToAdd.length > 0) {
-          await this.database.categories.bulkAdd(categoriesToAdd)
-        }
-
-        const existingServices = await this.database.services.toArray()
-        const existingIds = new Set(existingServices.map((service) => service.id))
-        const existingNames = new Set(
-          existingServices.map((service) => service.name.trim().toLocaleLowerCase('fr')),
-        )
-        const servicesToAdd = catalog.services.filter(
-          (service) =>
-            !existingIds.has(service.id) &&
-            !existingNames.has(service.name.trim().toLocaleLowerCase('fr')),
-        )
-        if (servicesToAdd.length > 0) {
-          await this.database.services.bulkAdd(servicesToAdd)
-        }
-
-        await this.database.settings.put({
-          ...(settings ?? buildDefaultSettings(nowIso)),
-          freshBarberCatalogSeededAt: nowIso,
-          updatedAt: nowIso,
-        })
-      },
-    )
-  }
-
   public async ensureInitialized(_legacySeedFlag?: boolean): Promise<void> {
     void _legacySeedFlag
     const [existingSalon, existingSettings] = await Promise.all([
@@ -451,12 +397,10 @@ export class SalonRepositoryHub {
       ) {
         await this.purgeLegacyMockData()
       }
-      await this.seedFreshBarberCatalogIfNeeded()
       return
     }
 
     const factoryBaselineIso = '1970-01-01T00:00:00.000Z'
-    const catalog = buildFreshBarberCatalog(factoryBaselineIso)
     await this.database.transaction(
       'rw',
       this.database.tables,
@@ -468,13 +412,12 @@ export class SalonRepositoryHub {
         await this.database.settings.put({
           ...buildDefaultSettings(factoryBaselineIso),
           dataHygieneVersion: CURRENT_DATA_HYGIENE_VERSION,
-          freshBarberCatalogSeededAt: factoryBaselineIso,
         })
-        await this.database.categories.bulkPut([
-          ...buildSystemCategories(factoryBaselineIso),
-          ...catalog.categories,
-        ])
-        await this.database.services.bulkPut(catalog.services)
+        // AGENTS.md §1 : seules les catégories comptables structurelles sont créées.
+        // Aucun catalogue de prestations, aucun salarié ni écriture pré-remplis.
+        await this.database.categories.bulkPut(
+          buildSystemCategories(factoryBaselineIso),
+        )
       },
     )
   }
@@ -2982,15 +2925,16 @@ export class SalonRepositoryHub {
   }
 
   /**
-   * Prépare l'enveloppe de synchronisation vers Neon PostgreSQL.
+   * Enveloppe de synchronisation Cloud : les comptes utilisateurs en sont
+   * volontairement EXCLUS (audit §6.1 S1). Ils sont provisionnés par un
+   * endpoint dédié, réservé au Gérant (`/api/users/provision`).
    */
   public async buildCloudSyncEnvelope(): Promise<{
     payload: SalonBackupPayload
     tombstones: LocalSyncTombstone[]
   }> {
-    const [state, users, persistedTombstones] = await Promise.all([
+    const [state, persistedTombstones] = await Promise.all([
       this.readFullState(),
-      this.database.users.toArray(),
       this.database.syncTombstones.toArray(),
     ])
     return {
@@ -3013,7 +2957,6 @@ export class SalonRepositoryHub {
         stockMovements: state.stockMovements,
         budgets: state.budgets,
         recurringExpenses: state.recurringExpenses,
-        users,
         correctionLogs: state.correctionLogs,
       },
       tombstones: persistedTombstones.map((tb) => ({
@@ -3025,6 +2968,18 @@ export class SalonRepositoryHub {
   }
 
   /**
+   * Comptes locaux à provisionner côté Cloud après une création hors-ligne.
+   * Transmet les hashes PBKDF2 déjà calculés localement, mais le serveur
+   * n'accepte QUE des créations (jamais d'écrasement d'un compte existant).
+   */
+  public async buildUserProvisioningEnvelope(): Promise<{
+    accounts: SalonUserAccount[]
+  }> {
+    const accounts = await this.database.users.toArray()
+    return { accounts }
+  }
+
+  /**
    * Fusionne sans perte (Last-Write-Wins par `updatedAt` / `createdAt`) les données
    * retournées par Neon PostgreSQL avec IndexedDB locale sans écraser une saisie hors-ligne plus récente.
    */
@@ -3033,7 +2988,63 @@ export class SalonRepositoryHub {
     tombstones?: LocalSyncTombstone[]
   }): Promise<{ mergedCount: number }> {
     if (!input.payload) return { mergedCount: 0 }
-    const remote = input.payload
+    return this.mergeRemoteState(input.payload, input.tombstones ?? [])
+  }
+
+  /**
+   * Fusion d'un **delta** serveur (P0-6) : seules les tables présentes dans
+   * `changes` sont touchées, les autres sont laissées intactes. Les suppressions
+   * arrivent séparément (`deleted`).
+   */
+  public async mergeCloudDelta(input: {
+    changes?: Record<string, unknown[]>
+    deleted?: LocalSyncTombstone[]
+  }): Promise<{ mergedCount: number }> {
+    const partial: Partial<SalonBackupPayload> = {}
+    const keyByTable: Record<string, keyof SalonBackupPayload> = {
+      salon_info: 'salon',
+      app_settings: 'settings',
+      categories: 'categories',
+      services_catalog: 'services',
+      employees: 'employees',
+      cash_sessions: 'cashSessions',
+      cash_movements: 'cashMovements',
+      revenues: 'revenues',
+      expenses: 'expenses',
+      recurring_expenses: 'recurringExpenses',
+      products: 'products',
+      stock_movements: 'stockMovements',
+      advances: 'advances',
+      bonuses: 'bonuses',
+      salary_payments: 'salaryPayments',
+      budgets: 'budgets',
+      correction_logs: 'correctionLogs',
+    }
+
+    for (const [table, rows] of Object.entries(input.changes ?? {})) {
+      const key = keyByTable[table]
+      if (!key || !Array.isArray(rows) || rows.length === 0) continue
+      if (key === 'salon' || key === 'settings') {
+        ;(partial as Record<string, unknown>)[key] = rows[0]
+      } else {
+        ;(partial as Record<string, unknown>)[key] = rows
+      }
+    }
+
+    if (
+      Object.keys(partial).length === 0 &&
+      (input.deleted ?? []).length === 0
+    ) {
+      return { mergedCount: 0 }
+    }
+
+    return this.mergeRemoteState(partial, input.deleted ?? [])
+  }
+
+  private async mergeRemoteState(
+    remote: Partial<SalonBackupPayload>,
+    tombstones: LocalSyncTombstone[],
+  ): Promise<{ mergedCount: number }> {
     let mergedCount = 0
 
     await this.database.transaction(
@@ -3041,20 +3052,23 @@ export class SalonRepositoryHub {
       this.database.tables,
       async () => {
         const localSalon = await this.database.salon.get('salon-main')
-        const sanitizedRemoteSalon = sanitizeLegacySalonInfo(
-          remote.salon,
-          null,
-          remote.salon.updatedAt,
-        ).cleaned
-        if (
-          !localSalon ||
-          sanitizedRemoteSalon.updatedAt > localSalon.updatedAt
-        ) {
-          await this.database.salon.put({
-            ...sanitizedRemoteSalon,
-            id: 'salon-main',
-          })
-          mergedCount += 1
+        // Delta : si le salon n'est pas présent, il n'a pas changé.
+        if (remote.salon) {
+          const sanitizedRemoteSalon = sanitizeLegacySalonInfo(
+            remote.salon,
+            null,
+            remote.salon.updatedAt,
+          ).cleaned
+          if (
+            !localSalon ||
+            sanitizedRemoteSalon.updatedAt > localSalon.updatedAt
+          ) {
+            await this.database.salon.put({
+              ...sanitizedRemoteSalon,
+              id: 'salon-main',
+            })
+            mergedCount += 1
+          }
         }
 
         const localSettings = await this.database.settings.get('default')
@@ -3127,24 +3141,8 @@ export class SalonRepositoryHub {
         )
         await mergeByUpdatedAt(this.database.budgets, remote.budgets)
 
-        for (const usr of remote.users ?? []) {
-          const curById = await this.database.users.get(usr.id)
-          const curByEmail = await this.database.users
-            .where('email')
-            .equals(usr.email.trim().toLowerCase())
-            .first()
-          const cur = curById ?? curByEmail
-          if (!cur || usr.updatedAt > cur.updatedAt) {
-            if (cur && cur.id !== usr.id) {
-              await this.database.users.delete(cur.id)
-            }
-            await this.database.users.put({
-              ...usr,
-              email: usr.email.trim().toLowerCase(),
-            })
-            mergedCount += 1
-          }
-        }
+        // Les comptes ne sont jamais fusionnés depuis un payload distant
+        // (audit §6.1 S1) : ils passent uniquement par /api/users*.
 
         await mergeImmutableById(
           this.database.stockMovements,
@@ -3183,7 +3181,7 @@ export class SalonRepositoryHub {
           }
         }
 
-        for (const tb of input.tombstones ?? []) {
+        for (const tb of tombstones) {
           const tbId = `${tb.entityType}:${tb.entityId}`
           const existingTb = await this.database.syncTombstones.get(tbId)
           if (!existingTb || tb.deletedAt >= existingTb.deletedAt) {
@@ -3359,8 +3357,14 @@ export class SalonRepositoryHub {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       throw new Error('Veuillez saisir une adresse e-mail valide.')
     }
-    if (password.length < 6) {
-      throw new Error('Le mot de passe doit contenir au moins 6 caractères.')
+    if (
+      password.length < 8 ||
+      !/[A-Za-z]/.test(password) ||
+      !/\d/.test(password)
+    ) {
+      throw new Error(
+        'Le mot de passe doit contenir au moins 8 caractères, avec au moins une lettre et un chiffre.',
+      )
     }
 
     const existing = await this.database.users

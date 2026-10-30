@@ -2,6 +2,16 @@
 -- SALON PRO — Schéma relationnel PostgreSQL (Neon Serverless Postgres)
 -- Montants financiers en Francs CFA entiers (BIGINT), horodatages ISO-8601
 -- Compatible mode Hybride Offline-First (IndexedDB Dexie <-> Neon PostgreSQL)
+--
+-- ATTENTION : ce fichier est la photographie de la migration 001_baseline.
+-- Le schéma appliqué en production est piloté par server/migrations.ts.
+-- La migration 002_multi_tenant y ajoute organizations, tenants, tenant_id
+-- sur les 19 tables et les politiques RLS tenant_isolation.
+-- La migration 003_sessions y ajoute la table sessions (jetons révocables).
+-- La migration 004_sync_revisions y ajoute sync_state et sync_changes (delta).
+-- La migration 005_memberships y ajoute memberships (rôle et activation par salon).
+-- La migration 006_subscriptions y ajoute subscriptions et subscription_events
+-- (abonnement porté par l'organisation : offre, essai, échéances, journal).
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS salon_info (

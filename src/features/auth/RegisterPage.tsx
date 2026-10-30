@@ -47,8 +47,14 @@ export function RegisterPage() {
       )
       return
     }
-    if (password.length < 6) {
-      setError('Le mot de passe doit contenir au moins 6 caractères.')
+    if (
+      password.length < 8 ||
+      !/[A-Za-z]/.test(password) ||
+      !/\d/.test(password)
+    ) {
+      setError(
+        'Le mot de passe doit contenir au moins 8 caractères, avec au moins une lettre et un chiffre.',
+      )
       return
     }
     if (password !== confirmPassword) {

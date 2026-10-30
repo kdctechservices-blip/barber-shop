@@ -38,10 +38,74 @@
    DATABASE_URL="postgresql://UTILISATEUR:MOT_DE_PASSE@VOTRE_HOTE.neon.tech/VOTRE_BASE?sslmode=require"
    SALON_AUTH_SECRET=""
    SALON_SYNC_PIN=""
+   SALON_DEFAULT_TENANT_ID="00000000-0000-0000-0000-000000000001"
    ```
    > **Sécurité** : Ne préfixez jamais ces variables par `VITE_`. Elles sont lues uniquement côté serveur (`server/viteApiPlugin.ts` en local et `api/[...route].ts` sur Vercel).
-2. Le schéma PostgreSQL complet (`19` tables relationnelles incluant `salon_users` + `sync_tombstones`) est initialisé automatiquement au premier appel, ou exécutable manuellement dans l'éditeur SQL Neon via `db/schema.sql`.
+2. Le schéma PostgreSQL est **versionné** (`server/migrations.ts`) et appliqué automatiquement au premier appel : `schema_migrations` enregistre les migrations `001_baseline` (schéma historique, 19 tables), `002_multi_tenant` (organisations, salons, `tenant_id` + RLS), `003_sessions` (sessions révocables) puis `004_sync_revisions` (journal de synchronisation delta), `005_memberships` (appartenances multi-salons) et `006_subscriptions` (abonnements par organisation). Le service worker (`dist/sw.js`) est généré par le build, pas par les migrations. Chaque migration s'exécute dans sa propre transaction et n'est jamais rejouée. `db/schema.sql` reste la référence lisible du schéma de base.
 3. Dans l'application, ouvrez **Paramètres → Cloud Neon** puis cliquez sur **Activer la synchronisation Neon**.
+
+### 3.1 Multi-salon : isolation et salon actif
+
+- Le modèle suit la chaîne **`organizations` → `tenants` → données métier**. Un *tenant* est un salon (nom, `slug`, fuseau `Africa/Abidjan`).
+- **Le salon n'est jamais transmis par le client.** Il provient du jeton de session signé (claim `tid`) ou, à défaut, de `SALON_DEFAULT_TENANT_ID` côté serveur. Un en-tête ou un champ `tenantId` envoyé par le navigateur est ignoré.
+- **Isolation en base** : les 18 tables métier portent `tenant_id` et subissent une *Row Level Security* activée **et forcée** (`FORCE ROW LEVEL SECURITY`) — même le propriétaire des tables est filtré. La politique `tenant_isolation` s'applique en lecture (`USING`) comme en écriture (`WITH CHECK`).
+- **Contexte transactionnel** : chaque opération serveur ouvre une transaction et pose `set_config('app.tenant_id', <salon>, true)` (`server/tenantContext.ts`). La portée locale garantit qu'aucun salon ne « fuit » vers la requête suivante d'une connexion mutualisée.
+- **Comptes** : `salon_users` reste hors RLS (l'authentification précède la connaissance du salon) mais toutes les requêtes filtrent explicitement `tenant_id`; l'unicité d'e-mail est désormais **par salon**.
+- **Première inscription** sur une base vierge : une organisation et un salon sont créés automatiquement, et l'utilisateur en devient Gérant. Les inscriptions ultérieures sans salon sont rattachées au salon par défaut et requièrent l'approbation du Gérant (`MANAGER_APPROVAL_REQUIRED`).
+
+### 3.2 Synchronisation delta serveur-autoritaire
+
+- **Le serveur décide**, le client propose : à chaque synchronisation, l'ordre des écritures est celui de **l'arrivée côté serveur**, plus jamais celui de l'horloge du navigateur.
+- Chaque salon possède un **curseur de révision** (`sync_state.revision`, verrouillé pendant le push). Un client qui présente son curseur ne reçoit que les changements survenus depuis (`sync_changes`), y compris ceux des autres appareils.
+- Réponses : `cursor`, `changes` (par table), `deleted` (suppressions). L'état complet n'est renvoyé qu'au premier échange, quand aucun curseur n'est fourni.
+- Un push **sans curseur** (appareil qui n'a pas encore récupéré l'état serveur) voit ses lignes plus anciennes écartées : impossible d'écraser des données récentes avec une copie périmée.
+- Côté navigateur, `mergeCloudDelta()` n'applique que les tables reçues et respecte les suppressions ; le curseur est conservé dans `localStorage`.
+
+### 3.3 Mode hors-ligne réel (service worker)
+
+- Après le premier chargement, l'application s'ouvre **sans réseau** : la coquille et tous les bundles sont précachés par `dist/sw.js`, généré à chaque build (liste réelle des fichiers + version dérivée de leur contenu).
+- Navigation : réseau d'abord, repli sur la coquille en cache. Ressources statiques : cache d'abord (noms hachés immuables).
+- **L'API n'est jamais mise en cache** : les données métier vivent dans IndexedDB et remontent via la synchronisation delta dès le retour du réseau.
+- Nouvelle version : elle attend en arrière-plan et s'active sur demande, sans interrompre une saisie.
+- Le service worker est désactivé en développement (aucune interférence avec le HMR).
+
+> Vérifier le mode hors-ligne : `npm run build && npm run preview`, ouvrir l'application, puis couper le réseau (DevTools → Network → Offline) et recharger.
+
+### 3.4 Équipe, rôles et multi-salon
+
+- **Identité ≠ appartenance** : `salon_users` porte les identifiants et le hash du mot de passe ; la table `memberships` porte le **rôle et l'activation par salon**. Un compte peut donc travailler dans plusieurs salons avec des rôles différents.
+- `GET /api/auth/tenants` liste les salons d'un compte ; `POST /api/auth/switch-tenant` bascule la session (rôle issu de l'appartenance, ancienne session révoquée).
+- **Les droits sont vérifiés en base à chaque appel** : une rétrogradation prend effet immédiatement, sans attendre l'expiration du jeton ; un changement de rôle ou une désactivation révoque toutes les sessions du compte.
+- **Écran « Équipe et abonnement »** (`/team`, réservé au Gérant) : liste des collaborateurs du salon, changement de rôle, désactivation/réactivation, ajout d'un collaborateur, consommation et limites de l'offre, demande de changement d'offre et résiliation. Hors mode Neon, l'écran liste les comptes de l'appareil et rappelle que la gestion d'équipe est une fonction cloud.
+- **Sélecteur de salon** dans la barre supérieure : il apparaît dès qu'un compte appartient à plusieurs salons ; la bascule passe par `POST /api/auth/switch-tenant` (ancienne session révoquée, rôle du jeton issu de l'appartenance).
+- **Garde de rôle par entité** : un Caissier saisit recettes, dépenses, caisse et mouvements de stock ; il ne peut pas modifier la configuration du salon, les référentiels (prestations, employés, produits), les budgets, salaires, avances ni les journaux de correction, et ne peut rien supprimer. Les tentatives refusées sont renvoyées dans `rejected` (`WRITE_FORBIDDEN_FOR_ROLE`, `DELETE_FORBIDDEN_FOR_ROLE`).
+
+### 3.5 Abonnements, essai et limites d'offre
+
+- **L'organisation est l'unité de facturation** : un abonnement (`subscriptions`, clé primaire `org_id`) couvre tous ses salons. Le salon hérité sans organisation n'est pas limité (compatibilité).
+- **Catalogue** (`server/plans.ts`) : Découverte (0 FCFA — 1 salon, 3 membres, 1 appareil), Starter (4 900 FCFA — 1 salon, 8 membres, 3 appareils), Professional (9 900 FCFA — 2 salons, 25 membres, 10 appareils), Business (19 900 FCFA — 5 salons, membres et appareils illimités), Enterprise (sur devis). `null` signifie **illimité**. Le prix Starter est une **hypothèse commerciale** à confirmer (le cahier des charges ne fixe que Professional et Business).
+- **Essai** : 14 jours de l'offre **Professional** à la création du salon, puis retour automatique à Découverte.
+- **Aucun paiement simulé** : une offre payante passe en `pending_payment` (les limites du gratuit s'appliquent) et n'est activée que par le **canal plateforme**, avec le code serveur `SALON_SYNC_PIN` (en-tête `x-salon-pin`). Une session utilisateur, même Gérant, ne peut pas s'auto-activer.
+- **Cycle de vie calculé à la lecture** : `trialing` → `active` → `past_due` (7 jours de grâce) → Découverte. Aucun ordonnanceur n'est nécessaire ; une résiliation (`cancel_at_period_end`) n'interrompt pas la période déjà payée.
+- **Limites appliquées** : l'ajout d'un membre (`/api/auth/register`, `/api/users/provision`) est plafonné par l'offre — au-delà, réponse **402 `PLAN_LIMIT_REACHED`** ; le provisionnement hors-ligne renvoie `blockedByPlan` au lieu d'échouer en bloc.
+- **Routes** : `GET /api/billing/plans` (public), `GET /api/billing/subscription`, `POST /api/billing/subscribe`, `POST /api/billing/cancel` (Gérant), `POST /api/billing/activate` (canal plateforme). Client navigateur : `src/lib/billingClient.ts`.
+- Journal d'audit applicatif : `subscription_events` (demande, activation, résiliation) + lignes `[audit] billing.*` côté serveur.
+
+### 3.6 Sécurité, rôles et administration des comptes
+
+- **`SALON_AUTH_SECRET` est obligatoire en production** (Vercel). Sans lui, chaque instance serverless signerait les sessions avec un secret différent et déconnecterait les utilisateurs. Génération : `openssl rand -hex 32`.
+- **Les comptes utilisateurs ne transitent jamais par la synchronisation.** Un payload `SALON_PRO_BACKUP_V1` ne peut donc ni créer, ni promouvoir, ni réécrire un compte (rôle ou hash de mot de passe). Toute administration passe par des routes dédiées, réservées à une session **Gérant** :
+  | Route | Méthode | Rôle | Usage |
+  |---|---|---|---|
+  | `/api/users` | `GET` | Gérant | Liste des comptes (jamais de hash exposé) |
+  | `/api/users/provision` | `POST` | Gérant | Provisionne les comptes créés hors-ligne (création seule, jamais d'écrasement) |
+  | `/api/users/:id` | `PATCH` | Gérant | Rôle, activation, identité, réinitialisation de mot de passe (haché côté serveur) |
+- **Garde-fous serveur** : impossible de retirer le rôle ou de désactiver le **dernier Gérant actif**, ni de désactiver son propre compte.
+- **Politique de mot de passe** : 8 caractères minimum, avec au moins une lettre et un chiffre (appliquée côté serveur **et** en mode hors-ligne).
+- **Anti-bruteforce** : 5 tentatives échouées par identifiant et par IP sur 15 minutes, 30 tentatives par IP, 10 créations de compte par heure.
+- **Sessions révocables** : le jeton d'accès est signé et ne dure que **15 minutes** ; il porte l'identifiant de session (`sid`) vérifié en base à chaque requête. Le **jeton de rafraîchissement** (opaque, stocké haché, durée 30 jours) est **à usage unique** : chaque rafraîchissement le fait tourner. Rejouer un jeton déjà consommé révoque toutes les sessions du compte. La déconnexion (`POST /api/auth/logout`) révoque la session immédiatement. Côté navigateur, `src/lib/sessionClient.ts` rafraîchit automatiquement avant expiration et rejoue la requête en cas de 401.
+- **En-têtes de sécurité** (CSP, HSTS, `X-Frame-Options`, `nosniff`, `Referrer-Policy`, `Permissions-Policy`) configurés dans `vercel.json`.
+- La synchronisation machine sans session (`SALON_SYNC_PIN`) reste possible pour compatibilité, mais elle est **dépréciée** et ne donne aucun accès à l'administration des comptes.
 
 ---
 

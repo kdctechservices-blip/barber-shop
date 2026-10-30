@@ -9,10 +9,12 @@ import {
 import type { LocalSyncTombstone } from '../db/repositories/salonRepositories'
 import type { SalonBackupPayload } from '../domain/models'
 import { useSalonStore } from '../hooks/salonStoreContext'
+import { fetchWithSession, readStoredSessionTokens } from '../lib/sessionClient'
 import { useToast } from '../hooks/toastContext'
 import { CloudSyncContext, type CloudSyncStatus } from './cloudSyncContext'
 
 const PREFS_KEY = 'salon_pro_cloud_sync_prefs'
+const CURSOR_KEY = 'salon_pro_cloud_sync_cursor'
 
 interface StoredSyncPrefs {
   enabled: boolean
@@ -70,6 +72,28 @@ function writeStoredPrefs(prefs: StoredSyncPrefs): void {
   }
 }
 
+/** Curseur de révision serveur (P0-6) : base des synchronisations delta. */
+function readStoredCursor(): string | null {
+  try {
+    const raw = window.localStorage.getItem(CURSOR_KEY)
+    return raw && /^\d+$/.test(raw) ? raw : null
+  } catch {
+    return null
+  }
+}
+
+function writeStoredCursor(cursor: string | null): void {
+  try {
+    if (cursor === null) {
+      window.localStorage.removeItem(CURSOR_KEY)
+      return
+    }
+    window.localStorage.setItem(CURSOR_KEY, cursor)
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
 export function CloudSyncProvider({ children }: { children: ReactNode }) {
   const { mutationCount, syncWithRepo } = useSalonStore()
   const toast = useToast()
@@ -121,27 +145,15 @@ export function CloudSyncProvider({ children }: { children: ReactNode }) {
         const envelope = await syncWithRepo((repo) =>
           repo.buildCloudSyncEnvelope(),
         )
-        const savedSessionToken = (() => {
-          try {
-            return (
-              window.sessionStorage.getItem('salon_pro_auth_token_session') ??
-              window.localStorage.getItem('salon_pro_auth_token_local') ??
-              ''
-            )
-          } catch {
-            return ''
-          }
-        })()
+        const savedSessionToken = readStoredSessionTokens().sessionToken ?? ''
 
-        const resp = await window.fetch('/api/sync', {
+        // `fetchWithSession` rafraîchit automatiquement un jeton d'accès expiré
+        // (rotation S4) avant de rejouer la requête.
+        const cursor = readStoredCursor()
+        const resp = await fetchWithSession('/api/sync', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(savedSessionToken
-              ? { Authorization: `Bearer ${savedSessionToken}` }
-              : {}),
-          },
-          body: JSON.stringify(envelope),
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...envelope, ...(cursor ? { cursor } : {}) }),
         })
 
         const data = (await resp.json().catch(() => ({}))) as {
@@ -152,6 +164,9 @@ export function CloudSyncProvider({ children }: { children: ReactNode }) {
           stats?: { totalRemoteRecords?: number }
           payload?: SalonBackupPayload
           tombstones?: LocalSyncTombstone[]
+          cursor?: string
+          changes?: Record<string, unknown[]>
+          deleted?: LocalSyncTombstone[]
         }
 
         if (!resp.ok || !data.ok) {
@@ -183,12 +198,43 @@ export function CloudSyncProvider({ children }: { children: ReactNode }) {
           return false
         }
 
-        await syncWithRepo((repo) =>
-          repo.mergeCloudSyncResult({
-            payload: data.payload ?? null,
-            tombstones: data.tombstones ?? [],
-          }),
-        )
+        // Delta quand le serveur en renvoie un, sinon état complet (premier sync).
+        if (data.changes || data.deleted) {
+          await syncWithRepo((repo) =>
+            repo.mergeCloudDelta({
+              changes: data.changes,
+              deleted: data.deleted ?? [],
+            }),
+          )
+        } else {
+          await syncWithRepo((repo) =>
+            repo.mergeCloudSyncResult({
+              payload: data.payload ?? null,
+              tombstones: data.tombstones ?? [],
+            }),
+          )
+        }
+
+        if (data.cursor) writeStoredCursor(String(data.cursor))
+
+        // Provisionnement des comptes créés hors-ligne : route dédiée,
+        // réservée au Gérant (un Caissier reçoit 403, ignoré silencieusement).
+        if (savedSessionToken) {
+          try {
+            const provisioning = await syncWithRepo((repo) =>
+              repo.buildUserProvisioningEnvelope(),
+            )
+            if (provisioning.accounts.length > 0) {
+              await fetchWithSession('/api/users/provision', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(provisioning),
+              })
+            }
+          } catch {
+            // Best-effort : la synchronisation des données reste prioritaire.
+          }
+        }
 
         const syncedAt = data.syncedAt ?? new Date().toISOString()
         const remoteRecordsCount =

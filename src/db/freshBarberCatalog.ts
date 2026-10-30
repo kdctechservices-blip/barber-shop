@@ -1,3 +1,12 @@
+/**
+ * GABARIT DE GRILLE TARIFAIRE — CONSULTATION / IMPORT MANUEL UNIQUEMENT.
+ *
+ * AGENTS.md §1 interdit toute injection automatique de données pré-remplies :
+ * ce module ne doit JAMAIS être appelé depuis `ensureInitialized`, la purge,
+ * la synchronisation ou l'inscription. Il est conservé uniquement comme
+ * référence métier pour une future action explicite du Gérant
+ * (« Importer une grille tarifaire »), jamais comme comportement par défaut.
+ */
 import type { CategoryItem, ServiceCatalogItem } from '../domain/models'
 
 const CATEGORY_DEFINITIONS = [

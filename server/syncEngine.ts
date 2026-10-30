@@ -27,7 +27,10 @@ import {
   stripLegacyDemoFlag,
 } from '../src/domain/mockPurge.ts'
 import type { SqlPoolLike, SqlQueryable } from './neonClient.ts'
-import { NEON_SCHEMA_SQL } from './neonSchema.ts'
+import { runMigrations } from './migrations.ts'
+import { isTenantId, setTenantContext } from './tenantContext.ts'
+import { canDeleteEntity, canWriteTable } from './permissions.ts'
+import type { UserRole } from '../src/domain/models/index.ts'
 
 export type { SyncTombstoneEntityType }
 
@@ -69,16 +72,48 @@ export interface CloudSyncResult {
     pushedRecords: number
     totalRemoteRecords: number
     tombstonesApplied: number
+    /** Lignes ou suppressions refusées faute de droits (garde de rôle). */
+    rejectedRecords?: number
   }
+  /** Détail des refus : utile au client pour signaler l'action non autorisée. */
+  rejected?: Array<{ table: string; id: string; reason: string }>
+  /** État complet — renvoyé uniquement aux clients qui ne fournissent pas de curseur. */
+  payload?: SalonBackupPayload
+  /** Tombstones connus — idem. */
+  tombstones?: SyncTombstone[]
+  /** Curseur de révision serveur à renvoyer au prochain push/pull. */
+  cursor: string
+  /** Changements survenus depuis le curseur fourni (delta), par table. */
+  changes?: Record<string, unknown[]>
+  /** Suppressions survenues depuis le curseur fourni. */
+  deleted?: SyncTombstone[]
+}
+
+/**
+ * Retire les comptes utilisateurs d'un payload de synchronisation.
+ * Défense en profondeur : même si un client (ou un attaquant) envoie des
+ * comptes, ils ne sont ni persistés, ni renvoyés.
+ */
+export function stripUsersFromSyncPayload(payload: SalonBackupPayload): {
   payload: SalonBackupPayload
-  tombstones: SyncTombstone[]
+  hadUsers: boolean
+} {
+  const hadUsers = Array.isArray(payload.users) && payload.users.length > 0
+  if (!hadUsers) return { payload, hadUsers }
+  const { users: _ignoredUsers, ...rest } = payload
+  void _ignoredUsers
+  return { payload: rest as SalonBackupPayload, hadUsers }
 }
 
 let schemaInitializedForPool = new WeakSet<object>()
 
+/**
+ * Applique les migrations versionnées (voir `server/migrations.ts`).
+ * Conservé sous ce nom pour compatibilité avec les appelants existants.
+ */
 export async function ensureNeonSchema(pool: SqlPoolLike): Promise<void> {
   if (schemaInitializedForPool.has(pool)) return
-  await pool.query(NEON_SCHEMA_SQL)
+  await runMigrations(pool)
   schemaInitializedForPool.add(pool)
 }
 
@@ -98,9 +133,12 @@ async function readRows<T>(
   db: SqlQueryable,
   tableName: string,
   orderByCol: string,
+  whereSql = '',
+  params: unknown[] = [],
 ): Promise<T[]> {
   const res = await db.query<PayloadRow<T>>(
-    `SELECT payload_json FROM ${tableName} ORDER BY ${orderByCol} ASC`,
+    `SELECT payload_json FROM ${tableName} ${whereSql} ORDER BY ${orderByCol} ASC`,
+    params,
   )
   return res.rows.map((r) => parseJsonRow<T>(r.payload_json))
 }
@@ -135,6 +173,7 @@ async function readAndPurgeMockRows<T extends { id: string }>(
 
 export async function readFullCloudState(
   db: SqlQueryable,
+  tenantId: string,
 ): Promise<{
   payload: SalonBackupPayload | null
   tombstones: SyncTombstone[]
@@ -213,7 +252,13 @@ export async function readFullCloudState(
       'budget',
       'period_month',
     ),
-    readRows<SalonUserAccount>(db, 'salon_users', 'created_at'),
+    readRows<SalonUserAccount>(
+      db,
+      'salon_users',
+      'created_at',
+      'WHERE tenant_id = $1',
+      [tenantId],
+    ),
     readAndPurgeMockRows<CorrectionLog>(
       db,
       'correction_logs',
@@ -267,14 +312,14 @@ export async function readFullCloudState(
       await db.query(
         `INSERT INTO salon_info (id, name, address, phone, manager_name, currency, updated_at, payload_json)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
-         ON CONFLICT (id) DO UPDATE SET
+         ON CONFLICT (tenant_id, id) DO UPDATE SET
            name = EXCLUDED.name,
            address = EXCLUDED.address,
            phone = EXCLUDED.phone,
            manager_name = EXCLUDED.manager_name,
            updated_at = EXCLUDED.updated_at,
            payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > salon_info.updated_at`,
+         WHERE salon_info.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
         [
           'salon-main',
           cleaned.name,
@@ -318,7 +363,8 @@ export async function readFullCloudState(
       stockMovements: stockMovementsClean,
       budgets: budgetsClean,
       recurringExpenses: recurringClean,
-      users,
+      // `users` est volontairement exclu : les comptes (rôles + hashes) ne sont
+      // jamais exposés à un client via la synchronisation (audit §6.1 S1).
       correctionLogs: correctionLogsClean,
     },
     tombstones,
@@ -326,13 +372,368 @@ export async function readFullCloudState(
   }
 }
 
+
+/* -------------------------------------------------------------------------- */
+/* Synchronisation delta serveur-autoritaire (P0-6)                            */
+/* -------------------------------------------------------------------------- */
+
 /**
- * Synchronisation bidirectionnelle transactionnelle (LWW par updated_at / created_at)
+ * Correspondance entre les tables SQL et les clés du payload de sauvegarde.
+ * `single` signale les tables à une seule ligne (salon, réglages).
+ */
+const DELTA_TABLES: Array<{
+  table: string
+  key: keyof SalonBackupPayload
+  single?: boolean
+}> = [
+  { table: 'salon_info', key: 'salon', single: true },
+  { table: 'app_settings', key: 'settings', single: true },
+  { table: 'categories', key: 'categories' },
+  { table: 'services_catalog', key: 'services' },
+  { table: 'employees', key: 'employees' },
+  { table: 'cash_sessions', key: 'cashSessions' },
+  { table: 'cash_movements', key: 'cashMovements' },
+  { table: 'revenues', key: 'revenues' },
+  { table: 'expenses', key: 'expenses' },
+  { table: 'recurring_expenses', key: 'recurringExpenses' },
+  { table: 'products', key: 'products' },
+  { table: 'stock_movements', key: 'stockMovements' },
+  { table: 'advances', key: 'advances' },
+  { table: 'bonuses', key: 'bonuses' },
+  { table: 'salary_payments', key: 'salaryPayments' },
+  { table: 'budgets', key: 'budgets' },
+  { table: 'correction_logs', key: 'correctionLogs' },
+]
+
+interface ChangeEntry {
+  table: string
+  rowId: string
+  op: 'upsert' | 'delete'
+  payload: unknown
+}
+
+function indexRows(
+  payload: SalonBackupPayload | null,
+): Map<string, string> {
+  const index = new Map<string, string>()
+  if (!payload) return index
+  for (const { table, key, single } of DELTA_TABLES) {
+    if (single) {
+      const row = payload[key] as unknown
+      if (row && typeof row === 'object' && 'id' in (row as object)) {
+        const id = String((row as { id: string }).id)
+        index.set(`${table}:${id}`, JSON.stringify(row))
+      }
+      continue
+    }
+    const rows = (payload[key] as unknown[] | undefined) ?? []
+    for (const row of rows) {
+      if (!row || typeof row !== 'object' || !('id' in (row as object))) continue
+      const id = String((row as { id: string }).id)
+      index.set(`${table}:${id}`, JSON.stringify(row))
+    }
+  }
+  return index
+}
+
+
+
+/**
+ * Retire du payload les tables qu'un acteur n'a pas le droit d'écrire.
+ * Le filtrage se fait **avant** l'écriture : la ligne refusée n'est jamais
+ * appliquée, et le client reçoit le détail du refus.
+ */
+function filterForbiddenPayload(
+  payload: SalonBackupPayload,
+  role: UserRole | undefined,
+  rejected: Array<{ table: string; id: string; reason: string }>,
+): SalonBackupPayload {
+  if (!role || role === 'manager') return payload
+  const filtered: SalonBackupPayload = { ...payload }
+
+  for (const { table, key, single } of DELTA_TABLES) {
+    if (canWriteTable(role, table)) continue
+    if (single) {
+      const row = payload[key] as { id?: string } | undefined
+      if (row) {
+        rejected.push({
+          table,
+          id: String(row.id ?? ''),
+          reason: 'WRITE_FORBIDDEN_FOR_ROLE',
+        })
+      }
+      ;(filtered as unknown as Record<string, unknown>)[key] = undefined
+      continue
+    }
+    const rows = (payload[key] as Array<{ id?: string }> | undefined) ?? []
+    for (const row of rows) {
+      rejected.push({
+        table,
+        id: String(row.id ?? ''),
+        reason: 'WRITE_FORBIDDEN_FOR_ROLE',
+      })
+    }
+    ;(filtered as unknown as Record<string, unknown>)[key] = []
+  }
+
+  return filtered
+}
+
+/**
+ * Filtre les lignes « périmées » d'un push complet (sans curseur).
+ *
+ * Un client qui n'a pas encore récupéré l'état serveur envoie un instantané
+ * complet : sans ce filtre, un appareil resté hors-ligne écraserait des données
+ * plus récentes. Les clients qui présentent un curseur sont, eux, à jour : leurs
+ * écritures sont appliquées dans l'ordre d'arrivée (autorité serveur).
+ */
+function dropStaleRows(
+  incoming: SalonBackupPayload,
+  stored: SalonBackupPayload | null,
+): SalonBackupPayload {
+  if (!stored) return incoming
+  const rowTimestamp = (row: unknown): string => {
+    if (!row || typeof row !== 'object') return ''
+    const record = row as { updatedAt?: string; createdAt?: string }
+    return record.updatedAt ?? record.createdAt ?? ''
+  }
+  const indexById = (rows: unknown[] | undefined): Map<string, unknown> => {
+    const map = new Map<string, unknown>()
+    for (const row of rows ?? []) {
+      if (row && typeof row === 'object' && 'id' in (row as object)) {
+        map.set(String((row as { id: string }).id), row)
+      }
+    }
+    return map
+  }
+
+  const next: SalonBackupPayload = { ...incoming }
+
+  for (const { key, single } of DELTA_TABLES) {
+    if (single) {
+      const incomingRow = incoming[key] as unknown
+      const storedRow = stored[key] as unknown
+      if (
+        incomingRow &&
+        storedRow &&
+        rowTimestamp(incomingRow) < rowTimestamp(storedRow)
+      ) {
+        ;(next as unknown as Record<string, unknown>)[key] = undefined
+      }
+      continue
+    }
+    const storedIndex = indexById(stored[key] as unknown[] | undefined)
+    const kept = ((incoming[key] as unknown[] | undefined) ?? []).filter(
+      (row) => {
+        if (!row || typeof row !== 'object' || !('id' in (row as object))) {
+          return true
+        }
+        const storedRow = storedIndex.get(String((row as { id: string }).id))
+        if (!storedRow) return true
+        return rowTimestamp(row) >= rowTimestamp(storedRow)
+      },
+    )
+    ;(next as unknown as Record<string, unknown>)[key] = kept
+  }
+
+  return next
+}
+
+/**
+ * Compare deux états complets et produit la liste des changements réels.
+ * Le serveur est seul juge : ce sont les états **stockés** qui sont comparés,
+ * jamais les horodatages fournis par les clients.
+ */
+function diffCloudStates(
+  before: {
+    payload: SalonBackupPayload | null
+    tombstones: SyncTombstone[]
+  },
+  after: { payload: SalonBackupPayload | null; tombstones: SyncTombstone[] },
+): ChangeEntry[] {
+  const beforeIndex = indexRows(before.payload)
+  const afterIndex = indexRows(after.payload)
+  const entries: ChangeEntry[] = []
+
+  for (const [compositeKey, serialized] of afterIndex) {
+    if (beforeIndex.get(compositeKey) === serialized) continue
+    const separator = compositeKey.indexOf(':')
+    const table = compositeKey.slice(0, separator)
+    const rowId = compositeKey.slice(separator + 1)
+    entries.push({
+      table,
+      rowId,
+      op: 'upsert',
+      payload: JSON.parse(serialized) as unknown,
+    })
+  }
+
+  const beforeTombstones = new Set(
+    before.tombstones.map((tb) => `${tb.entityType}:${tb.entityId}`),
+  )
+  for (const tb of after.tombstones) {
+    const key = `${tb.entityType}:${tb.entityId}`
+    if (beforeTombstones.has(key)) continue
+    entries.push({ table: 'sync_tombstones', rowId: key, op: 'delete', payload: tb })
+  }
+
+  return entries
+}
+
+/**
+ * Alloue des révisions et journalise les changements dans `sync_changes`.
+ * Le verrou `FOR UPDATE` sur `sync_state` sérialise les push d'un même salon :
+ * l'ordre de validation des révisions est donc l'ordre d'attribution, ce qui
+ * interdit les « trous » qu'un lecteur pourrait manquer.
+ */
+async function appendSyncChanges(
+  client: SqlQueryable,
+  tenantId: string,
+  entries: ChangeEntry[],
+): Promise<string> {
+  await client.query(
+    'INSERT INTO sync_state (tenant_id) VALUES ($1) ON CONFLICT (tenant_id) DO NOTHING',
+    [tenantId],
+  )
+  const lockRes = await client.query<{ revision: string | number }>(
+    'SELECT revision FROM sync_state WHERE tenant_id = $1 FOR UPDATE',
+    [tenantId],
+  )
+  const current = Number(lockRes.rows[0]?.revision ?? 0)
+
+  if (entries.length === 0) return String(current)
+
+  const nextRes = await client.query<{ revision: string | number }>(
+    `UPDATE sync_state
+        SET revision = revision + $2, updated_at = now()
+      WHERE tenant_id = $1
+      RETURNING revision`,
+    [tenantId, entries.length],
+  )
+  const next = Number(nextRes.rows[0]?.revision ?? current + entries.length)
+  const first = next - entries.length + 1
+
+  for (let i = 0; i < entries.length; i += 1) {
+    const entry = entries[i]
+    await client.query(
+      `INSERT INTO sync_changes (tenant_id, seq, table_name, row_id, op, payload_json)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+      [
+        tenantId,
+        first + i,
+        entry.table,
+        entry.rowId,
+        entry.op,
+        entry.payload === null || entry.payload === undefined
+          ? null
+          : JSON.stringify(entry.payload),
+      ],
+    )
+  }
+
+  return String(next)
+}
+
+/** Révision courante (curseur) d'un salon. */
+export async function readSyncRevision(
+  db: SqlQueryable,
+  tenantId: string,
+): Promise<string> {
+  const res = await db.query<{ revision: string | number }>(
+    'SELECT revision FROM sync_state WHERE tenant_id = $1',
+    [tenantId],
+  )
+  return String(Number(res.rows[0]?.revision ?? 0))
+}
+
+/**
+ * Lit le journal des changements postérieurs à `since` et le condense :
+ * une seule entrée par ligne (la plus récente), plus les suppressions.
+ */
+export async function readSyncChangesSince(
+  db: SqlQueryable,
+  tenantId: string,
+  since: string | number | undefined,
+): Promise<{
+  cursor: string
+  changes: Record<string, unknown[]>
+  deleted: SyncTombstone[]
+}> {
+  const sinceValue = Number(since ?? 0)
+  const safeSince = Number.isFinite(sinceValue) && sinceValue > 0 ? sinceValue : 0
+
+  const res = await db.query<{
+    seq: string | number
+    table_name: string
+    row_id: string
+    op: string
+    payload_json: unknown
+  }>(
+    `SELECT seq, table_name, row_id, op, payload_json
+       FROM sync_changes
+      WHERE tenant_id = $1 AND seq > $2
+      ORDER BY seq ASC`,
+    [tenantId, safeSince],
+  )
+
+  const revisionRes = await db.query<{ revision: string | number }>(
+    'SELECT revision FROM sync_state WHERE tenant_id = $1',
+    [tenantId],
+  )
+  const revision = Number(revisionRes.rows[0]?.revision ?? 0)
+
+  const latest = new Map<string, { op: string; payload: unknown }>()
+  let maxSeq = safeSince
+  for (const row of res.rows) {
+    const seq = Number(row.seq)
+    if (seq > maxSeq) maxSeq = seq
+    latest.set(`${row.table_name}:${row.row_id}`, {
+      op: row.op,
+      payload:
+        typeof row.payload_json === 'string'
+          ? JSON.parse(row.payload_json)
+          : row.payload_json,
+    })
+  }
+
+  const changes: Record<string, unknown[]> = {}
+  const deleted: SyncTombstone[] = []
+  for (const [compositeKey, entry] of latest) {
+    if (entry.op === 'delete') {
+      const tombstone = entry.payload as SyncTombstone | null
+      if (tombstone?.entityType && tombstone?.entityId) deleted.push(tombstone)
+      continue
+    }
+    const table = compositeKey.slice(0, compositeKey.indexOf(':'))
+    if (!entry.payload) continue
+    changes[table] = changes[table] ?? []
+    changes[table].push(entry.payload)
+  }
+
+  return {
+    cursor: String(Math.max(maxSeq, revision)),
+    changes,
+    deleted,
+  }
+}
+
+/**
+ * Synchronisation bidirectionnelle transactionnelle, **autoritaire côté serveur**.
+ *
+ * Les clients envoient leur état ; le serveur décide de l'ordre (arrivée), de
+ * l'état retenu et attribue une révision monotone. Un client qui fournit un
+ * curseur (`cursor`) reçoit uniquement le **delta** des changements survenus
+ * depuis, y compris ceux des autres appareils.
  */
 export async function syncWithNeonDatabase(
   pool: SqlPoolLike,
   incoming: CloudSyncEnvelope,
+  tenantId: string,
+  options?: { cursor?: string | number; role?: UserRole },
 ): Promise<CloudSyncResult> {
+  if (!isTenantId(tenantId)) {
+    throw new Error('Synchronisation refusée : contexte de salon invalide.')
+  }
   await ensureNeonSchema(pool)
   const client = await pool.connect()
   const syncedAt = new Date().toISOString()
@@ -341,8 +742,44 @@ export async function syncWithNeonDatabase(
 
   try {
     await client.query('BEGIN')
+    await setTenantContext(client, tenantId)
 
-    const p = incoming.payload
+    // État avant application : sert à calculer le delta réel (contenus comparés,
+    // jamais les horodatages fournis par les clients).
+    const before = await readFullCloudState(client, tenantId)
+
+    const { payload: rawPayload, hadUsers } = stripUsersFromSyncPayload(
+      incoming.payload,
+    )
+    if (hadUsers) {
+      console.warn(
+        '[security] Payload de synchronisation contenant des comptes ignoré : ' +
+          "l'administration des comptes passe exclusivement par /api/users.",
+      )
+    }
+
+    // Garde de rôle par entité : un Caissier ne peut pas modifier la
+    // configuration du salon, les référentiels, les budgets ni les salaires,
+    // et ne peut rien supprimer (audit S3).
+    const rejected: Array<{ table: string; id: string; reason: string }> = []
+    const allowedPayload = filterForbiddenPayload(rawPayload, options?.role, rejected)
+    const allowedTombstones = (incoming.tombstones ?? []).filter((tb) => {
+      if (canDeleteEntity(options?.role, tb.entityType)) return true
+      rejected.push({
+        table: TOMBSTONE_TABLE_MAP[tb.entityType]?.table ?? 'sync_tombstones',
+        id: tb.entityId,
+        reason: 'DELETE_FORBIDDEN_FOR_ROLE',
+      })
+      return false
+    })
+
+    const cursorProvidedEarly =
+      options?.cursor !== undefined && options?.cursor !== null
+    // Push « à l'aveugle » (sans curseur) : les lignes plus anciennes que l'état
+    // serveur sont écartées pour ne pas écraser des données récentes.
+    const p = cursorProvidedEarly
+      ? allowedPayload
+      : dropStaleRows(allowedPayload, before.payload)
 
     // 1. SalonInfo (nettoyé de toute valeur fictive héritée)
     if (p.salon) {
@@ -354,14 +791,14 @@ export async function syncWithNeonDatabase(
       const r = await client.query(
         `INSERT INTO salon_info (id, name, address, phone, manager_name, currency, updated_at, payload_json)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
-         ON CONFLICT (id) DO UPDATE SET
+         ON CONFLICT (tenant_id, id) DO UPDATE SET
            name = EXCLUDED.name,
            address = EXCLUDED.address,
            phone = EXCLUDED.phone,
            manager_name = EXCLUDED.manager_name,
            updated_at = EXCLUDED.updated_at,
            payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > salon_info.updated_at`,
+         WHERE salon_info.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
         [
           'salon-main',
           cleanSalon.name,
@@ -381,14 +818,14 @@ export async function syncWithNeonDatabase(
       const r = await client.query(
         `INSERT INTO app_settings (id, theme, date_format, receipt_format, last_backup_exported_at, updated_at, payload_json)
          VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-         ON CONFLICT (id) DO UPDATE SET
+         ON CONFLICT (tenant_id, id) DO UPDATE SET
            theme = EXCLUDED.theme,
            date_format = EXCLUDED.date_format,
            receipt_format = EXCLUDED.receipt_format,
            last_backup_exported_at = EXCLUDED.last_backup_exported_at,
            updated_at = EXCLUDED.updated_at,
            payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > app_settings.updated_at`,
+         WHERE app_settings.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
         [
           'default',
           p.settings.theme,
@@ -412,7 +849,7 @@ export async function syncWithNeonDatabase(
            is_archived = EXCLUDED.is_archived,
            updated_at = EXCLUDED.updated_at,
            payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > categories.updated_at`,
+         WHERE categories.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
         [
           c.id,
           c.scope,
@@ -432,14 +869,14 @@ export async function syncWithNeonDatabase(
       const r = await client.query(
         `INSERT INTO services_catalog (id, name, category_code, reference_price, is_active, updated_at, payload_json)
          VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-         ON CONFLICT (id) DO UPDATE SET
+         ON CONFLICT (tenant_id, id) DO UPDATE SET
            name = EXCLUDED.name,
            category_code = EXCLUDED.category_code,
            reference_price = EXCLUDED.reference_price,
            is_active = EXCLUDED.is_active,
            updated_at = EXCLUDED.updated_at,
            payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > services_catalog.updated_at`,
+         WHERE services_catalog.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
         [
           s.id,
           s.name,
@@ -468,7 +905,7 @@ export async function syncWithNeonDatabase(
            is_active = EXCLUDED.is_active,
            updated_at = EXCLUDED.updated_at,
            payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > employees.updated_at`,
+         WHERE employees.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
         [
           e.id,
           e.fullName,
@@ -500,7 +937,7 @@ export async function syncWithNeonDatabase(
            status = EXCLUDED.status,
            updated_at = EXCLUDED.updated_at,
            payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > cash_sessions.updated_at`,
+         WHERE cash_sessions.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
         [
           cs.id,
           cs.openedAt,
@@ -529,7 +966,7 @@ export async function syncWithNeonDatabase(
            amount = EXCLUDED.amount,
            updated_at = EXCLUDED.updated_at,
            payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > cash_movements.updated_at`,
+         WHERE cash_movements.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
         [
           cm.id,
           cm.sessionId,
@@ -560,7 +997,7 @@ export async function syncWithNeonDatabase(
            is_archived = EXCLUDED.is_archived,
            updated_at = EXCLUDED.updated_at,
            payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > revenues.updated_at`,
+         WHERE revenues.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
         [
           rev.id,
           rev.ticketId ?? null,
@@ -595,7 +1032,7 @@ export async function syncWithNeonDatabase(
            is_archived = EXCLUDED.is_archived,
            updated_at = EXCLUDED.updated_at,
            payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > expenses.updated_at`,
+         WHERE expenses.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
         [
           exp.id,
           exp.date,
@@ -627,7 +1064,7 @@ export async function syncWithNeonDatabase(
            is_active = EXCLUDED.is_active,
            updated_at = EXCLUDED.updated_at,
            payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > recurring_expenses.updated_at`,
+         WHERE recurring_expenses.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
         [
           tpl.id,
           tpl.label,
@@ -661,7 +1098,7 @@ export async function syncWithNeonDatabase(
            is_active = EXCLUDED.is_active,
            updated_at = EXCLUDED.updated_at,
            payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > products.updated_at`,
+         WHERE products.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
         [
           prd.id,
           prd.sku,
@@ -713,7 +1150,7 @@ export async function syncWithNeonDatabase(
            is_archived = EXCLUDED.is_archived,
            updated_at = EXCLUDED.updated_at,
            payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > advances.updated_at`,
+         WHERE advances.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
         [
           adv.id,
           adv.employeeId,
@@ -758,7 +1195,7 @@ export async function syncWithNeonDatabase(
            is_partial = EXCLUDED.is_partial,
            updated_at = EXCLUDED.updated_at,
            payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > salary_payments.updated_at`,
+         WHERE salary_payments.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
         [
           sp.id,
           sp.employeeId,
@@ -784,7 +1221,7 @@ export async function syncWithNeonDatabase(
            planned_amount = EXCLUDED.planned_amount,
            updated_at = EXCLUDED.updated_at,
            payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > budgets.updated_at`,
+         WHERE budgets.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
         [
           bdg.id,
           bdg.periodMonth,
@@ -798,38 +1235,8 @@ export async function syncWithNeonDatabase(
       pushedRecords += r.rowCount ?? 0
     }
 
-    // 12. CorrectionLogs & Comptes Utilisateurs
-    for (const usr of p.users ?? []) {
-      const r = await client.query(
-        `INSERT INTO salon_users (id, email, full_name, phone, role, password_hash, is_active, last_login_at, created_at, updated_at, payload_json)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
-         ON CONFLICT (id) DO UPDATE SET
-           email = EXCLUDED.email,
-           full_name = EXCLUDED.full_name,
-           phone = EXCLUDED.phone,
-           role = EXCLUDED.role,
-           password_hash = EXCLUDED.password_hash,
-           is_active = EXCLUDED.is_active,
-           last_login_at = EXCLUDED.last_login_at,
-           updated_at = EXCLUDED.updated_at,
-           payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > salon_users.updated_at`,
-        [
-          usr.id,
-          usr.email,
-          usr.fullName,
-          usr.phone ?? null,
-          usr.role,
-          usr.passwordHash,
-          usr.isActive,
-          usr.lastLoginAt ?? null,
-          usr.createdAt,
-          usr.updatedAt,
-          JSON.stringify(usr),
-        ],
-      )
-      pushedRecords += r.rowCount ?? 0
-    }
+    // Les comptes utilisateurs ne transitent JAMAIS par la synchronisation
+    // (audit §6.1 S1) : ils sont administrés uniquement via /api/users*.
 
     for (const log of (p.correctionLogs ?? []).filter(
       (x) => !isLegacyMockRecord(x),
@@ -852,7 +1259,7 @@ export async function syncWithNeonDatabase(
     }
 
     // 13. Tombstones de suppressions définitives (budgets, modèles récurrents, prestations non utilisées)
-    for (const tb of incoming.tombstones ?? []) {
+    for (const tb of allowedTombstones) {
       await client.query(
         `INSERT INTO sync_tombstones (entity_type, entity_id, deleted_at)
          VALUES ($1, $2, $3)
@@ -880,7 +1287,21 @@ export async function syncWithNeonDatabase(
       tombstonesApplied += delRes.rowCount ?? 0
     }
 
-    const merged = await readFullCloudState(client)
+    const merged = await readFullCloudState(client, tenantId)
+
+    // Journalisation des changements réels + attribution des révisions.
+    const entries = diffCloudStates(before, merged)
+    await appendSyncChanges(client, tenantId, entries)
+
+    const cursorProvided = options?.cursor !== undefined && options?.cursor !== null
+    const delta = cursorProvided
+      ? await readSyncChangesSince(client, tenantId, options?.cursor)
+      : {
+          cursor: await readSyncRevision(client, tenantId),
+          changes: {} as Record<string, unknown[]>,
+          deleted: [] as SyncTombstone[],
+        }
+
     await client.query('COMMIT')
 
     return {
@@ -890,9 +1311,16 @@ export async function syncWithNeonDatabase(
         pushedRecords,
         totalRemoteRecords: merged.totalRemoteRecords,
         tombstonesApplied,
+        rejectedRecords: rejected.length,
       },
-      payload: merged.payload ?? p,
-      tombstones: merged.tombstones,
+      ...(rejected.length > 0 ? { rejected } : {}),
+      cursor: delta.cursor,
+      changes: delta.changes,
+      deleted: delta.deleted,
+      // Compatibilité : un client sans curseur reçoit l'état complet.
+      ...(cursorProvided
+        ? {}
+        : { payload: merged.payload ?? p, tombstones: merged.tombstones }),
     }
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {})
