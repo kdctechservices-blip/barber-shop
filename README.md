@@ -41,7 +41,7 @@
    SALON_DEFAULT_TENANT_ID="00000000-0000-0000-0000-000000000001"
    ```
    > **Sécurité** : Ne préfixez jamais ces variables par `VITE_`. Elles sont lues uniquement côté serveur (`server/viteApiPlugin.ts` en local et `api/[...route].ts` sur Vercel).
-2. Le schéma PostgreSQL est **versionné** (`server/migrations.ts`) et appliqué automatiquement au premier appel : `schema_migrations` enregistre les migrations `001_baseline` (schéma historique, 19 tables), `002_multi_tenant` (organisations, salons, `tenant_id` + RLS) puis `003_sessions` (sessions révocables). Chaque migration s'exécute dans sa propre transaction et n'est jamais rejouée. `db/schema.sql` reste la référence lisible du schéma de base.
+2. Le schéma PostgreSQL est **versionné** (`server/migrations.ts`) et appliqué automatiquement au premier appel : `schema_migrations` enregistre les migrations `001_baseline` (schéma historique, 19 tables), `002_multi_tenant` (organisations, salons, `tenant_id` + RLS), `003_sessions` (sessions révocables) puis `004_sync_revisions` (journal de synchronisation delta). Chaque migration s'exécute dans sa propre transaction et n'est jamais rejouée. `db/schema.sql` reste la référence lisible du schéma de base.
 3. Dans l'application, ouvrez **Paramètres → Cloud Neon** puis cliquez sur **Activer la synchronisation Neon**.
 
 ### 3.1 Multi-salon : isolation et salon actif
@@ -53,7 +53,15 @@
 - **Comptes** : `salon_users` reste hors RLS (l'authentification précède la connaissance du salon) mais toutes les requêtes filtrent explicitement `tenant_id`; l'unicité d'e-mail est désormais **par salon**.
 - **Première inscription** sur une base vierge : une organisation et un salon sont créés automatiquement, et l'utilisateur en devient Gérant. Les inscriptions ultérieures sans salon sont rattachées au salon par défaut et requièrent l'approbation du Gérant (`MANAGER_APPROVAL_REQUIRED`).
 
-### 3.2 Sécurité, rôles et administration des comptes
+### 3.2 Synchronisation delta serveur-autoritaire
+
+- **Le serveur décide**, le client propose : à chaque synchronisation, l'ordre des écritures est celui de **l'arrivée côté serveur**, plus jamais celui de l'horloge du navigateur.
+- Chaque salon possède un **curseur de révision** (`sync_state.revision`, verrouillé pendant le push). Un client qui présente son curseur ne reçoit que les changements survenus depuis (`sync_changes`), y compris ceux des autres appareils.
+- Réponses : `cursor`, `changes` (par table), `deleted` (suppressions). L'état complet n'est renvoyé qu'au premier échange, quand aucun curseur n'est fourni.
+- Un push **sans curseur** (appareil qui n'a pas encore récupéré l'état serveur) voit ses lignes plus anciennes écartées : impossible d'écraser des données récentes avec une copie périmée.
+- Côté navigateur, `mergeCloudDelta()` n'applique que les tables reçues et respecte les suppressions ; le curseur est conservé dans `localStorage`.
+
+### 3.3 Sécurité, rôles et administration des comptes
 
 - **`SALON_AUTH_SECRET` est obligatoire en production** (Vercel). Sans lui, chaque instance serverless signerait les sessions avec un secret différent et déconnecterait les utilisateurs. Génération : `openssl rand -hex 32`.
 - **Les comptes utilisateurs ne transitent jamais par la synchronisation.** Un payload `SALON_PRO_BACKUP_V1` ne peut donc ni créer, ni promouvoir, ni réécrire un compte (rôle ou hash de mot de passe). Toute administration passe par des routes dédiées, réservées à une session **Gérant** :

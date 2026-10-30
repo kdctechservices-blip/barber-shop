@@ -14,6 +14,7 @@ import { useToast } from '../hooks/toastContext'
 import { CloudSyncContext, type CloudSyncStatus } from './cloudSyncContext'
 
 const PREFS_KEY = 'salon_pro_cloud_sync_prefs'
+const CURSOR_KEY = 'salon_pro_cloud_sync_cursor'
 
 interface StoredSyncPrefs {
   enabled: boolean
@@ -66,6 +67,28 @@ function readStoredPrefs(): StoredSyncPrefs {
 function writeStoredPrefs(prefs: StoredSyncPrefs): void {
   try {
     window.localStorage.setItem(PREFS_KEY, JSON.stringify(prefs))
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+/** Curseur de révision serveur (P0-6) : base des synchronisations delta. */
+function readStoredCursor(): string | null {
+  try {
+    const raw = window.localStorage.getItem(CURSOR_KEY)
+    return raw && /^\d+$/.test(raw) ? raw : null
+  } catch {
+    return null
+  }
+}
+
+function writeStoredCursor(cursor: string | null): void {
+  try {
+    if (cursor === null) {
+      window.localStorage.removeItem(CURSOR_KEY)
+      return
+    }
+    window.localStorage.setItem(CURSOR_KEY, cursor)
   } catch {
     // ignore storage quota errors
   }
@@ -126,10 +149,11 @@ export function CloudSyncProvider({ children }: { children: ReactNode }) {
 
         // `fetchWithSession` rafraîchit automatiquement un jeton d'accès expiré
         // (rotation S4) avant de rejouer la requête.
+        const cursor = readStoredCursor()
         const resp = await fetchWithSession('/api/sync', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(envelope),
+          body: JSON.stringify({ ...envelope, ...(cursor ? { cursor } : {}) }),
         })
 
         const data = (await resp.json().catch(() => ({}))) as {
@@ -140,6 +164,9 @@ export function CloudSyncProvider({ children }: { children: ReactNode }) {
           stats?: { totalRemoteRecords?: number }
           payload?: SalonBackupPayload
           tombstones?: LocalSyncTombstone[]
+          cursor?: string
+          changes?: Record<string, unknown[]>
+          deleted?: LocalSyncTombstone[]
         }
 
         if (!resp.ok || !data.ok) {
@@ -171,12 +198,24 @@ export function CloudSyncProvider({ children }: { children: ReactNode }) {
           return false
         }
 
-        await syncWithRepo((repo) =>
-          repo.mergeCloudSyncResult({
-            payload: data.payload ?? null,
-            tombstones: data.tombstones ?? [],
-          }),
-        )
+        // Delta quand le serveur en renvoie un, sinon état complet (premier sync).
+        if (data.changes || data.deleted) {
+          await syncWithRepo((repo) =>
+            repo.mergeCloudDelta({
+              changes: data.changes,
+              deleted: data.deleted ?? [],
+            }),
+          )
+        } else {
+          await syncWithRepo((repo) =>
+            repo.mergeCloudSyncResult({
+              payload: data.payload ?? null,
+              tombstones: data.tombstones ?? [],
+            }),
+          )
+        }
+
+        if (data.cursor) writeStoredCursor(String(data.cursor))
 
         // Provisionnement des comptes créés hors-ligne : route dédiée,
         // réservée au Gérant (un Caissier reçoit 403, ignoré silencieusement).

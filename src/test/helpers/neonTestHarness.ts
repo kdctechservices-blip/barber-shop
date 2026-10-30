@@ -20,6 +20,11 @@ import type { SqlClientLike, SqlPoolLike } from '../../../server/neonClient'
 export interface StoredRow {
   id: string
   tenant_id?: string
+  revision?: string | number
+  seq?: string | number
+  table_name?: string
+  row_id?: string
+  op?: string
   updated_at?: string
   created_at?: string
   deleted_at?: string
@@ -51,7 +56,15 @@ const TENANT_SCOPED_TABLES = new Set([
 ])
 
 /** Hors RLS : l'authentification précède la connaissance du salon. */
-const GLOBAL_TABLES = ['salon_users', 'organizations', 'tenants', 'sessions', 'schema_migrations']
+const GLOBAL_TABLES = [
+  'salon_users',
+  'organizations',
+  'tenants',
+  'sessions',
+  'schema_migrations',
+  'sync_state',
+  'sync_changes',
+]
 
 const ALL_TABLE_NAMES = [...TENANT_SCOPED_TABLES, ...GLOBAL_TABLES]
 
@@ -232,6 +245,57 @@ export function createInMemoryNeonPool(options?: { failNetwork?: boolean }): {
       return { rows: [], rowCount }
     }
 
+    // Journal de synchronisation delta (P0-6)
+    if (/^INSERT INTO sync_state\b/i.test(normalized)) {
+      const tbl = tables.get('sync_state')!
+      const tenantId = String(values[0])
+      if (!tbl.has(tenantId)) {
+        tbl.set(tenantId, { id: tenantId, tenant_id: tenantId, revision: '0' })
+      }
+      return { rows: [], rowCount: 1 }
+    }
+
+    if (/^SELECT revision FROM sync_state/i.test(normalized)) {
+      const row = tables.get('sync_state')!.get(String(values[0]))
+      return {
+        rows: (row ? [{ revision: row.revision }] : []) as R[],
+        rowCount: row ? 1 : 0,
+      }
+    }
+
+    if (/^UPDATE sync_state SET revision = revision \+ \$2/i.test(normalized)) {
+      const tenantId = String(values[0])
+      const delta = Number(values[1])
+      const tbl = tables.get('sync_state')!
+      const row: StoredRow = tbl.get(tenantId) ?? {
+        id: tenantId,
+        tenant_id: tenantId,
+        revision: '0',
+      }
+      const revision = String(Number(row.revision ?? 0) + delta)
+      tbl.set(tenantId, { ...row, revision })
+      return { rows: [{ revision }] as R[], rowCount: 1 }
+    }
+
+    if (/^SELECT seq, table_name, row_id, op, payload_json FROM sync_changes/i.test(normalized)) {
+      const tenantId = String(values[0])
+      const since = Number(values[1] ?? 0)
+      const rows = Array.from(tables.get('sync_changes')!.values())
+        .filter(
+          (row) =>
+            row.tenant_id === tenantId && Number(row.seq ?? 0) > since,
+        )
+        .sort((a, b) => Number(a.seq) - Number(b.seq))
+        .map((row) => ({
+          seq: row.seq,
+          table_name: row.table_name,
+          row_id: row.row_id,
+          op: row.op,
+          payload_json: row.payload_json,
+        })) as R[]
+      return { rows, rowCount: rows.length }
+    }
+
     // SELECT payload_json FROM <table> ...
     const selectPayloadMatch = normalized.match(
       /^SELECT payload_json(?:, tenant_id)? FROM ([a-z_]+)/i,
@@ -379,10 +443,14 @@ export function createInMemoryNeonPool(options?: { failNetwork?: boolean }): {
         return { rows: [], rowCount: 1 }
       }
 
-      if (existing && existing.updated_at && incomingUpdated) {
-        if (!(existing.updated_at < incomingUpdated)) {
-          return { rows: [], rowCount: 0 }
-        }
+      // Sémantique serveur-autoritaire (P0-6) : l'horodatage du client ne
+      // décide plus rien. Une écriture est ignorée seulement si le contenu est
+      // identique (équivalent de `payload_json IS DISTINCT FROM EXCLUDED.payload_json`).
+      if (
+        existing &&
+        JSON.stringify(existing.payload_json) === JSON.stringify(parsedPayload)
+      ) {
+        return { rows: [], rowCount: 0 }
       }
 
       tbl.set(key, row)

@@ -2988,7 +2988,63 @@ export class SalonRepositoryHub {
     tombstones?: LocalSyncTombstone[]
   }): Promise<{ mergedCount: number }> {
     if (!input.payload) return { mergedCount: 0 }
-    const remote = input.payload
+    return this.mergeRemoteState(input.payload, input.tombstones ?? [])
+  }
+
+  /**
+   * Fusion d'un **delta** serveur (P0-6) : seules les tables présentes dans
+   * `changes` sont touchées, les autres sont laissées intactes. Les suppressions
+   * arrivent séparément (`deleted`).
+   */
+  public async mergeCloudDelta(input: {
+    changes?: Record<string, unknown[]>
+    deleted?: LocalSyncTombstone[]
+  }): Promise<{ mergedCount: number }> {
+    const partial: Partial<SalonBackupPayload> = {}
+    const keyByTable: Record<string, keyof SalonBackupPayload> = {
+      salon_info: 'salon',
+      app_settings: 'settings',
+      categories: 'categories',
+      services_catalog: 'services',
+      employees: 'employees',
+      cash_sessions: 'cashSessions',
+      cash_movements: 'cashMovements',
+      revenues: 'revenues',
+      expenses: 'expenses',
+      recurring_expenses: 'recurringExpenses',
+      products: 'products',
+      stock_movements: 'stockMovements',
+      advances: 'advances',
+      bonuses: 'bonuses',
+      salary_payments: 'salaryPayments',
+      budgets: 'budgets',
+      correction_logs: 'correctionLogs',
+    }
+
+    for (const [table, rows] of Object.entries(input.changes ?? {})) {
+      const key = keyByTable[table]
+      if (!key || !Array.isArray(rows) || rows.length === 0) continue
+      if (key === 'salon' || key === 'settings') {
+        ;(partial as Record<string, unknown>)[key] = rows[0]
+      } else {
+        ;(partial as Record<string, unknown>)[key] = rows
+      }
+    }
+
+    if (
+      Object.keys(partial).length === 0 &&
+      (input.deleted ?? []).length === 0
+    ) {
+      return { mergedCount: 0 }
+    }
+
+    return this.mergeRemoteState(partial, input.deleted ?? [])
+  }
+
+  private async mergeRemoteState(
+    remote: Partial<SalonBackupPayload>,
+    tombstones: LocalSyncTombstone[],
+  ): Promise<{ mergedCount: number }> {
     let mergedCount = 0
 
     await this.database.transaction(
@@ -2996,20 +3052,23 @@ export class SalonRepositoryHub {
       this.database.tables,
       async () => {
         const localSalon = await this.database.salon.get('salon-main')
-        const sanitizedRemoteSalon = sanitizeLegacySalonInfo(
-          remote.salon,
-          null,
-          remote.salon.updatedAt,
-        ).cleaned
-        if (
-          !localSalon ||
-          sanitizedRemoteSalon.updatedAt > localSalon.updatedAt
-        ) {
-          await this.database.salon.put({
-            ...sanitizedRemoteSalon,
-            id: 'salon-main',
-          })
-          mergedCount += 1
+        // Delta : si le salon n'est pas présent, il n'a pas changé.
+        if (remote.salon) {
+          const sanitizedRemoteSalon = sanitizeLegacySalonInfo(
+            remote.salon,
+            null,
+            remote.salon.updatedAt,
+          ).cleaned
+          if (
+            !localSalon ||
+            sanitizedRemoteSalon.updatedAt > localSalon.updatedAt
+          ) {
+            await this.database.salon.put({
+              ...sanitizedRemoteSalon,
+              id: 'salon-main',
+            })
+            mergedCount += 1
+          }
         }
 
         const localSettings = await this.database.settings.get('default')
@@ -3122,7 +3181,7 @@ export class SalonRepositoryHub {
           }
         }
 
-        for (const tb of input.tombstones ?? []) {
+        for (const tb of tombstones) {
           const tbId = `${tb.entityType}:${tb.entityId}`
           const existingTb = await this.database.syncTombstones.get(tbId)
           if (!existingTb || tb.deletedAt >= existingTb.deletedAt) {

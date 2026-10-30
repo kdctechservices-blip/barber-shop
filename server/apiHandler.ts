@@ -30,6 +30,7 @@ import {
 import {
   ensureNeonSchema,
   readFullCloudState,
+  readSyncChangesSince,
   syncWithNeonDatabase,
   type CloudSyncEnvelope,
 } from './syncEngine.ts'
@@ -622,6 +623,21 @@ export async function handleSalonApiRequest(
     try {
       await ensureNeonSchema(pool)
       const tenantId = callerSession?.tid ?? resolveDefaultTenantId()
+      const since = urlObj.searchParams.get('since')
+      if (since !== null) {
+        // Mode delta (P0-6) : uniquement ce qui a changé depuis le curseur.
+        const delta = await withTenantClient(pool, tenantId, (client) =>
+          readSyncChangesSince(client, tenantId, since),
+        )
+        sendJson(res, 200, {
+          ok: true,
+          syncedAt: new Date().toISOString(),
+          cursor: delta.cursor,
+          changes: delta.changes,
+          deleted: delta.deleted,
+        })
+        return true
+      }
       const state = await withTenantClient(pool, tenantId, (client) =>
         readFullCloudState(client, tenantId),
       )
@@ -645,7 +661,9 @@ export async function handleSalonApiRequest(
 
   if (pathname === '/api/sync' && req.method === 'POST') {
     try {
-      const body = (await readJsonBody(req)) as Partial<CloudSyncEnvelope>
+      const body = (await readJsonBody(req)) as Partial<CloudSyncEnvelope> & {
+        cursor?: string | number
+      }
       if (
         !body ||
         !body.payload ||
@@ -668,6 +686,7 @@ export async function handleSalonApiRequest(
           tombstones: Array.isArray(body.tombstones) ? body.tombstones : [],
         },
         tenantId,
+        { cursor: body.cursor },
       )
       sendJson(res, 200, result as unknown as Record<string, unknown>)
     } catch (err) {

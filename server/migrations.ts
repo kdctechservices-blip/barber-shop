@@ -143,6 +143,54 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (tenant_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions (expires_at);
 `
 
+
+/**
+ * Synchronisation delta serveur-autoritaire (P0-6).
+ *
+ * `sync_state` porte le compteur de révision par salon ; il est verrouillé
+ * (`SELECT … FOR UPDATE`) pendant chaque push, ce qui garantit que les
+ * révisions sont **attribuées et validées dans l'ordre** : un lecteur qui a vu
+ * la révision N a nécessairement vu toutes les précédentes.
+ *
+ * `sync_changes` est le journal immuable des changements acceptés : c'est lui
+ * qui alimente les deltas (`seq > curseur`), y compris pour les autres appareils.
+ */
+export const SYNC_REVISIONS_SQL = `
+CREATE TABLE IF NOT EXISTS sync_state (
+  tenant_id uuid PRIMARY KEY,
+  revision bigint NOT NULL DEFAULT 0,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS sync_changes (
+  tenant_id uuid NOT NULL,
+  seq bigint NOT NULL,
+  table_name text NOT NULL,
+  row_id text NOT NULL,
+  op text NOT NULL,
+  payload_json jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_changes_tenant_seq ON sync_changes (tenant_id, seq);
+CREATE INDEX IF NOT EXISTS idx_sync_changes_row ON sync_changes (tenant_id, table_name, row_id);
+
+ALTER TABLE sync_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sync_state FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON sync_state;
+CREATE POLICY tenant_isolation ON sync_state
+  USING (tenant_id = current_setting('app.tenant_id', true)::uuid)
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);
+
+ALTER TABLE sync_changes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sync_changes FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON sync_changes;
+CREATE POLICY tenant_isolation ON sync_changes
+  USING (tenant_id = current_setting('app.tenant_id', true)::uuid)
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);
+`
+
 export const MIGRATIONS: Migration[] = [
   {
     id: '001_baseline',
@@ -158,6 +206,11 @@ export const MIGRATIONS: Migration[] = [
     id: '003_sessions',
     label: 'Sessions révocables et jetons de rafraîchissement',
     sql: SESSIONS_SQL,
+  },
+  {
+    id: '004_sync_revisions',
+    label: 'Journal de synchronisation delta et révisions serveur',
+    sql: SYNC_REVISIONS_SQL,
   },
 ]
 

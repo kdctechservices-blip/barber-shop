@@ -653,9 +653,9 @@ Estimations : **j-h**, 1 développeur senior + assistance IA. `P0` = bloquant s�
 
 ---
 
-## 11. Suivi des correctifs — Sprints 1, 2 & 3 (implémentés)
+## 11. Suivi des correctifs — Sprints 1 à 4 (implémentés)
 
-> Mise à jour du 30 octobre 2026, branche `arena/139c7e36-barber-shop`. Sprint 1 : périmètre P0-1 / P0-5 / P0-8 du backlog. Sprint 2 : P0-2 (isolation multi-tenant + RLS) et P0-4 (migrations versionnées). Sprint 3 : S4 (sessions révocables).
+> Mise à jour du 30 octobre 2026, branche `arena/139c7e36-barber-shop`. Sprint 1 : périmètre P0-1 / P0-5 / P0-8 du backlog. Sprint 2 : P0-2 (isolation multi-tenant + RLS) et P0-4 (migrations versionnées). Sprint 3 : S4 (sessions révocables). Sprint 4 : P0-6 (synchronisation delta serveur-autoritaire).
 
 ### 11.1 Vulnérabilités traitées
 
@@ -663,9 +663,9 @@ Estimations : **j-h**, 1 développeur senior + assistance IA. `P0` = bloquant s�
 |---|---|---|
 | **S1** (critique) — escalade via `/api/sync` | ✅ **Corrigée** | `users` retiré de `buildCloudSyncEnvelope`, ignoré côté serveur (`stripUsersFromSyncPayload`), absent des payloads de pull et de la fusion locale. Routes dédiées `/api/users`, `/api/users/provision`, `PATCH /api/users/:id` réservées au Gérant, avec provisionnement en **création seule** (aucun écrasement de rôle ou de hash). |
 | **S2** (critique) — aucun cloisonnement entre salons | ✅ **Corrigée** | `organizations` → `tenants` → données : `tenant_id` sur les 19 tables, RLS activée **et forcée** sur les 18 tables métier (politique `USING` + `WITH CHECK`), contexte posé par transaction (`set_config('app.tenant_id', …, true)`). Le salon provient du jeton signé (`tid`) ou du serveur, jamais de la requête. Voir §11.4. |
-| **S3** (élevée) — aucune autorisation serveur | 🟡 **Partielle** | Autorisation serveur ajoutée sur toute l'administration des comptes (401 sans session, 403 hors Gérant, rate limit par acteur). L'autorisation **par entité métier** sur `/api/sync*` reste à faire avec la synchronisation delta (P0-3/P0-6). |
+| **S3** (élevée) — aucune autorisation serveur | 🟡 **Partielle** | Autorisation serveur sur toute l'administration des comptes (401 sans session, 403 hors Gérant, rate limit par acteur). Depuis P0-6, les données ne sont plus écrites sous la dictée du client (ordre et contenu validés côté serveur, isolation par salon). Reste : autorisation **par entité métier** (qui peut modifier quoi) et garde de rôle sur les routes métier. |
 | **S4** (élevée) — sessions non révocables | ✅ **Corrigée** | Table `sessions` (migration `003_sessions`), jeton d'accès signé de 15 min porteur du claim `sid`, jeton de rafraîchissement opaque haché en base, rotation à usage unique, détection de rejeu révoquant toute la famille, révocation immédiate à la déconnexion. Voir §11.6. |
-| **S5** (élevée) — LWW sur horodatage client | 🟡 **Partielle** | Les mises à jour de comptes utilisent désormais un horodatage serveur strictement croissant ; les données métier restent en LWW client jusqu'à P0-6. |
+| **S5** (élevée) — LWW sur horodatage client | ✅ **Corrigée** | Un client à jour (curseur) ne peut plus figer ni écraser une ligne par une horloge artificielle : le serveur applique les écritures **dans l'ordre d'arrivée** et attribue la révision. Les push « à l'aveugle » (sans curseur) restent filtrés par horodatage pour ne pas écraser de données récentes. Voir §11.7. |
 | **S6** (moyenne) — bruteforce / politique faible | ✅ **Corrigée** | Rate limiting (5/identité + 30/IP sur 15 min, 10 inscriptions/heure), politique 8 caractères lettre + chiffre côté serveur **et** hors-ligne, buckets réinitialisés après une connexion réussie. |
 | **S7** (moyenne) — secret non persistant en serverless | ✅ **Corrigée** | `SALON_AUTH_SECRET` obligatoire en production (`AUTH_SECRET_MISSING` explicite) ; repli local persistant conservé hors production. |
 | **S8** (élevée) — aucun mécanisme de migration | ✅ **Corrigée** | `server/migrations.ts` : registre `schema_migrations`, migrations `001_baseline` / `002_multi_tenant`, exécution transactionnelle, idempotence testée. Voir §11.4. |
@@ -785,11 +785,65 @@ Nouveaux tests :
 - La table `sessions` n'est pas purgée automatiquement (les lignes expirées s'accumulent) : une tâche `DELETE FROM sessions WHERE expires_at < now() - interval '30 days'` est à planifier avec les sauvegardes (P1).
 - L'écran d'administration des appareils connectés et la révocation ciblée par le Gérant restent à construire (P1).
 
-### 11.6 Reste à faire
 
-1. **P0-6** — synchronisation delta serveur-autoritaire (résout S3 côté données et S5 définitivement).
-2. **P0-7** — service worker / mode hors-ligne réel.
-3. **P1** — `memberships` (plusieurs salons par utilisateur), garde de rôle sur les routes métier, abonnements et limites de plan, purge des sessions expirées, écran « appareils connectés ».
+### 11.7 Sprint 4 — synchronisation delta serveur-autoritaire (implémenté)
+
+#### Principe
+
+| Avant (Sprint 3) | Après (P0-6) |
+|---|---|
+| Le client décidait de l'ordre via `updated_at` (horloge locale) | Le **serveur** décide : chaque push est appliqué à son arrivée, après comparaison des contenus réellement stockés |
+| Chaque pull renvoyait **tout** l'état du salon | Un client présente un **curseur** et ne reçoit que les changements survenus depuis |
+| Aucune trace des changements (impossible de savoir qui a bougé quoi) | Journal immuable `sync_changes` avec révision monotone par salon |
+
+#### Schéma (migration `004_sync_revisions`)
+
+- `sync_state (tenant_id, revision)` : compteur de révision **verrouillé** (`SELECT … FOR UPDATE`) pendant chaque push. Les révisions sont donc attribuées et validées dans l'ordre : un lecteur qui a vu la révision *N* a vu toutes les précédentes.
+- `sync_changes (tenant_id, seq, table_name, row_id, op, payload_json)` : journal des changements acceptés (`upsert` / `delete`), indexé par `(tenant_id, seq)`.
+- Les deux tables sont protégées par RLS (`tenant_isolation`, `USING` + `WITH CHECK`).
+
+#### Fonctionnement d'un push
+
+1. Lecture de l'état **avant** application (dans la même transaction).
+2. Application « à l'aveugle » (sans curseur) : les lignes dont l'horodatage est **antérieur** à l'état serveur sont écartées — un appareil resté hors-ligne ne peut plus écraser des données récentes.
+3. Application avec curseur (client à jour) : les contenus sont comparés (`payload_json IS DISTINCT FROM EXCLUDED.payload_json`), l'ordre d'arrivée fait foi.
+4. Lecture de l'état **après**, calcul du delta réel (contenus comparés, jamais les horodatages clients).
+5. Attribution des révisions et journalisation dans `sync_changes`.
+6. Réponse : `cursor`, `changes` (par table), `deleted` (tombstones) — et l'état complet uniquement si le client n'a pas fourni de curseur.
+
+#### API
+
+| Route | Paramètre | Réponse |
+|---|---|---|
+| `POST /api/sync` | `cursor?` dans le corps | `cursor`, `changes`, `deleted` (+ `payload` complet si aucun curseur) |
+| `GET /api/sync/pull?since=<cursor>` | `since` | delta condensé (une entrée par ligne, la plus récente) + `cursor` |
+
+#### Côté client
+
+- `CloudSyncProvider` persiste le curseur (`salon_pro_cloud_sync_cursor`), l'envoie à chaque push et l'avance à la réponse.
+- Nouveau `mergeCloudDelta()` : fusionne **uniquement** les tables présentes dans `changes`, applique `deleted`, et laisse intact le reste de l'état local.
+
+#### Validation
+
+| Commande | Résultat |
+|---|---|
+| `npm run lint` | 0 erreur, 0 avertissement (115 fichiers) |
+| `npm test` | **82/82** tests verts (16 fichiers) |
+| `npm run build` | OK |
+
+`src/test/deltaSync.test.ts` (6 tests) couvre : état complet puis delta ciblé, autorité serveur face à une horloge client « 2099 », absence de révision quand rien ne change, propagation des suppressions, cloisonnement des journaux par salon, et fusion d'un delta côté client (tables absentes préservées, suppressions appliquées).
+
+#### Limites assumées
+
+- Le journal `sync_changes` n'est pas encore compacté : prévoir une purge (par exemple conserver 30 jours ou les 10 000 dernières révisions par salon) avec la tâche de maintenance P1.
+- La granularité du delta est **la ligne**, pas le champ : deux appareils qui modifient deux champs différents de la même ligne gardent le dernier reçu (résolution « dernière écriture reçue »).
+- Un push reste un instantané complet côté client : le suivi des seules lignes modifiées (dirty tracking) réduira encore la charge réseau (P1).
+
+### 11.8 Reste à faire
+
+1. **P0-7** — service worker / mode hors-ligne réel.
+2. **P1** — `memberships` multi-salons, garde de rôle sur les routes métier, abonnements et limites de plan, purge des sessions et du journal de synchronisation, écran « appareils connectés », dirty tracking côté client.
+
 
 ## Annexe A — Inventaire des fichiers (par rôle)
 
