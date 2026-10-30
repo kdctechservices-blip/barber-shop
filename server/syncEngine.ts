@@ -27,7 +27,8 @@ import {
   stripLegacyDemoFlag,
 } from '../src/domain/mockPurge.ts'
 import type { SqlPoolLike, SqlQueryable } from './neonClient.ts'
-import { NEON_SCHEMA_SQL } from './neonSchema.ts'
+import { runMigrations } from './migrations.ts'
+import { isTenantId, setTenantContext } from './tenantContext.ts'
 
 export type { SyncTombstoneEntityType }
 
@@ -92,9 +93,13 @@ export function stripUsersFromSyncPayload(payload: SalonBackupPayload): {
 
 let schemaInitializedForPool = new WeakSet<object>()
 
+/**
+ * Applique les migrations versionnées (voir `server/migrations.ts`).
+ * Conservé sous ce nom pour compatibilité avec les appelants existants.
+ */
 export async function ensureNeonSchema(pool: SqlPoolLike): Promise<void> {
   if (schemaInitializedForPool.has(pool)) return
-  await pool.query(NEON_SCHEMA_SQL)
+  await runMigrations(pool)
   schemaInitializedForPool.add(pool)
 }
 
@@ -114,9 +119,12 @@ async function readRows<T>(
   db: SqlQueryable,
   tableName: string,
   orderByCol: string,
+  whereSql = '',
+  params: unknown[] = [],
 ): Promise<T[]> {
   const res = await db.query<PayloadRow<T>>(
-    `SELECT payload_json FROM ${tableName} ORDER BY ${orderByCol} ASC`,
+    `SELECT payload_json FROM ${tableName} ${whereSql} ORDER BY ${orderByCol} ASC`,
+    params,
   )
   return res.rows.map((r) => parseJsonRow<T>(r.payload_json))
 }
@@ -151,6 +159,7 @@ async function readAndPurgeMockRows<T extends { id: string }>(
 
 export async function readFullCloudState(
   db: SqlQueryable,
+  tenantId: string,
 ): Promise<{
   payload: SalonBackupPayload | null
   tombstones: SyncTombstone[]
@@ -229,7 +238,13 @@ export async function readFullCloudState(
       'budget',
       'period_month',
     ),
-    readRows<SalonUserAccount>(db, 'salon_users', 'created_at'),
+    readRows<SalonUserAccount>(
+      db,
+      'salon_users',
+      'created_at',
+      'WHERE tenant_id = $1',
+      [tenantId],
+    ),
     readAndPurgeMockRows<CorrectionLog>(
       db,
       'correction_logs',
@@ -283,7 +298,7 @@ export async function readFullCloudState(
       await db.query(
         `INSERT INTO salon_info (id, name, address, phone, manager_name, currency, updated_at, payload_json)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
-         ON CONFLICT (id) DO UPDATE SET
+         ON CONFLICT (tenant_id, id) DO UPDATE SET
            name = EXCLUDED.name,
            address = EXCLUDED.address,
            phone = EXCLUDED.phone,
@@ -349,7 +364,11 @@ export async function readFullCloudState(
 export async function syncWithNeonDatabase(
   pool: SqlPoolLike,
   incoming: CloudSyncEnvelope,
+  tenantId: string,
 ): Promise<CloudSyncResult> {
+  if (!isTenantId(tenantId)) {
+    throw new Error('Synchronisation refusée : contexte de salon invalide.')
+  }
   await ensureNeonSchema(pool)
   const client = await pool.connect()
   const syncedAt = new Date().toISOString()
@@ -358,6 +377,7 @@ export async function syncWithNeonDatabase(
 
   try {
     await client.query('BEGIN')
+    await setTenantContext(client, tenantId)
 
     const { payload: p, hadUsers } = stripUsersFromSyncPayload(incoming.payload)
     if (hadUsers) {
@@ -377,7 +397,7 @@ export async function syncWithNeonDatabase(
       const r = await client.query(
         `INSERT INTO salon_info (id, name, address, phone, manager_name, currency, updated_at, payload_json)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
-         ON CONFLICT (id) DO UPDATE SET
+         ON CONFLICT (tenant_id, id) DO UPDATE SET
            name = EXCLUDED.name,
            address = EXCLUDED.address,
            phone = EXCLUDED.phone,
@@ -404,7 +424,7 @@ export async function syncWithNeonDatabase(
       const r = await client.query(
         `INSERT INTO app_settings (id, theme, date_format, receipt_format, last_backup_exported_at, updated_at, payload_json)
          VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-         ON CONFLICT (id) DO UPDATE SET
+         ON CONFLICT (tenant_id, id) DO UPDATE SET
            theme = EXCLUDED.theme,
            date_format = EXCLUDED.date_format,
            receipt_format = EXCLUDED.receipt_format,
@@ -455,7 +475,7 @@ export async function syncWithNeonDatabase(
       const r = await client.query(
         `INSERT INTO services_catalog (id, name, category_code, reference_price, is_active, updated_at, payload_json)
          VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-         ON CONFLICT (id) DO UPDATE SET
+         ON CONFLICT (tenant_id, id) DO UPDATE SET
            name = EXCLUDED.name,
            category_code = EXCLUDED.category_code,
            reference_price = EXCLUDED.reference_price,
@@ -873,7 +893,7 @@ export async function syncWithNeonDatabase(
       tombstonesApplied += delRes.rowCount ?? 0
     }
 
-    const merged = await readFullCloudState(client)
+    const merged = await readFullCloudState(client, tenantId)
     await client.query('COMMIT')
 
     return {

@@ -31,6 +31,7 @@ import {
   syncWithNeonDatabase,
   type CloudSyncEnvelope,
 } from './syncEngine.ts'
+import { resolveDefaultTenantId, withTenantClient } from './tenantContext.ts'
 
 export interface ApiHandlerOptions {
   poolOverride?: SqlPoolLike | null
@@ -502,7 +503,10 @@ export async function handleSalonApiRequest(
   if (pathname === '/api/sync/verify' && req.method === 'POST') {
     try {
       await ensureNeonSchema(pool)
-      const state = await readFullCloudState(pool)
+      const tenantId = callerSession?.tid ?? resolveDefaultTenantId()
+      const state = await withTenantClient(pool, tenantId, (client) =>
+        readFullCloudState(client, tenantId),
+      )
       sendJson(res, 200, {
         ok: true,
         connected: true,
@@ -525,7 +529,10 @@ export async function handleSalonApiRequest(
   if (pathname === '/api/sync/pull' && req.method === 'GET') {
     try {
       await ensureNeonSchema(pool)
-      const state = await readFullCloudState(pool)
+      const tenantId = callerSession?.tid ?? resolveDefaultTenantId()
+      const state = await withTenantClient(pool, tenantId, (client) =>
+        readFullCloudState(client, tenantId),
+      )
       sendJson(res, 200, {
         ok: true,
         syncedAt: new Date().toISOString(),
@@ -561,10 +568,15 @@ export async function handleSalonApiRequest(
         return true
       }
 
-      const result = await syncWithNeonDatabase(pool, {
-        payload: body.payload,
-        tombstones: Array.isArray(body.tombstones) ? body.tombstones : [],
-      })
+      const tenantId = callerSession?.tid ?? resolveDefaultTenantId()
+      const result = await syncWithNeonDatabase(
+        pool,
+        {
+          payload: body.payload,
+          tombstones: Array.isArray(body.tombstones) ? body.tombstones : [],
+        },
+        tenantId,
+      )
       sendJson(res, 200, result as unknown as Record<string, unknown>)
     } catch (err) {
       const formatted = formatDbError(err)

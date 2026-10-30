@@ -390,6 +390,8 @@ export interface SalonUserAccount {
   lastLoginAt?: string
   createdAt: string
   updatedAt: string
+  /** Salon (tenant) d'appartenance — attribué par le serveur, jamais par le client. */
+  tenantId?: string
 }
 
 export type PublicSalonUser = Omit<SalonUserAccount, 'passwordHash'>

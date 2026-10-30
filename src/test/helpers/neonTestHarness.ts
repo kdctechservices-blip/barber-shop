@@ -1,15 +1,25 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { EventEmitter } from 'node:events'
 import { handleSalonApiRequest } from '../../../server/apiHandler'
+import { MIGRATIONS } from '../../../server/migrations'
 import type { SqlClientLike, SqlPoolLike } from '../../../server/neonClient'
 
 /**
  * Harnais de test partagé : simulateur léger de pool PostgreSQL et
  * invocateur de la fonction serverless /api/*.
+ *
+ * Le simulateur reproduit volontairement les deux garanties structurantes du
+ * schéma réel :
+ *  - `tenant_id` attribué par défaut depuis `app.tenant_id` (paramètre posé
+ *    par `set_config` au début de chaque transaction) ;
+ *  - isolation RLS : une lecture sans contexte de salon ne renvoie rien, et un
+ *    salon ne voit jamais les lignes d'un autre (sauf `salon_users`, hors RLS
+ *    car l'authentification précède la connaissance du salon).
  */
 
 export interface StoredRow {
   id: string
+  tenant_id?: string
   updated_at?: string
   created_at?: string
   deleted_at?: string
@@ -18,39 +28,57 @@ export interface StoredRow {
   payload_json?: unknown
 }
 
-/**
- * Simulateur léger de pool PostgreSQL supportant exactement les requêtes SQL
- * paramétrées utilisées par `server/syncEngine.ts` (transactions BEGIN/COMMIT,
- * upserts LWW sur `updated_at`, tables immuables, et `sync_tombstones`).
- */
+/** Tables soumises à RLS dans PostgreSQL (tout sauf comptes/plateforme). */
+const TENANT_SCOPED_TABLES = new Set([
+  'salon_info',
+  'app_settings',
+  'categories',
+  'services_catalog',
+  'employees',
+  'cash_sessions',
+  'cash_movements',
+  'revenues',
+  'expenses',
+  'recurring_expenses',
+  'products',
+  'stock_movements',
+  'advances',
+  'bonuses',
+  'salary_payments',
+  'budgets',
+  'correction_logs',
+  'sync_tombstones',
+])
+
+const ALL_TABLE_NAMES = [
+  ...TENANT_SCOPED_TABLES,
+  'salon_users',
+  'organizations',
+  'tenants',
+  'schema_migrations',
+]
+
 export function createInMemoryNeonPool(options?: { failNetwork?: boolean }): {
   pool: SqlPoolLike
   tables: Map<string, Map<string, StoredRow>>
 } {
   const tables = new Map<string, Map<string, StoredRow>>()
-  const allTableNames = [
-    'salon_info',
-    'app_settings',
-    'categories',
-    'services_catalog',
-    'employees',
-    'cash_sessions',
-    'cash_movements',
-    'revenues',
-    'expenses',
-    'recurring_expenses',
-    'products',
-    'stock_movements',
-    'advances',
-    'bonuses',
-    'salary_payments',
-    'budgets',
-    'salon_users',
-    'correction_logs',
-    'sync_tombstones',
-  ]
-  for (const name of allTableNames) {
+  for (const name of ALL_TABLE_NAMES) {
     tables.set(name, new Map())
+  }
+
+  let currentTenant: string | null = null
+  const rowKey = (table: string, id: string): string => {
+    if (!TENANT_SCOPED_TABLES.has(table)) return id
+    if (!currentTenant) return `∅::${id}`
+    return `${currentTenant}::${id}`
+  }
+
+  const visibleRows = (table: string): StoredRow[] => {
+    const rows = Array.from(tables.get(table)?.values() ?? [])
+    if (!TENANT_SCOPED_TABLES.has(table)) return rows
+    if (!currentTenant) return []
+    return rows.filter((row) => row.tenant_id === currentTenant)
   }
 
   const executeQuery = async <R = Record<string, unknown>>(
@@ -65,143 +93,201 @@ export function createInMemoryNeonPool(options?: { failNetwork?: boolean }): {
 
     if (
       normalized === 'BEGIN' ||
-      normalized === 'COMMIT' ||
-      normalized === 'ROLLBACK' ||
-      normalized.startsWith('CREATE TABLE') ||
-      normalized.startsWith('CREATE INDEX')
+      normalized === 'ROLLBACK'
+    ) {
+      currentTenant = null
+      return { rows: [], rowCount: 0 }
+    }
+    if (normalized === 'COMMIT') {
+      currentTenant = null
+      return { rows: [], rowCount: 0 }
+    }
+
+    // Contexte multi-tenant posé par `withTenantClient`
+    if (/^SELECT set_config\('app\.tenant_id'/i.test(normalized)) {
+      currentTenant = String(values[0] ?? '') || null
+      return {
+        rows: [{ set_config: currentTenant }] as R[],
+        rowCount: 1,
+      }
+    }
+
+    // Migrations : le DDL est ignoré par le simulateur (pas de moteur SQL),
+    // mais le registre `schema_migrations` est réellement tenu à jour.
+    if (
+      /^(CREATE|ALTER|DROP|COMMENT|GRANT|REVOKE|DO)\b/i.test(normalized)
     ) {
       return { rows: [], rowCount: 0 }
+    }
+    // Le simulateur n'interprète pas le DDL : on considère les migrations
+    // comme appliquées (leur contenu SQL est couvert par migrations.test.ts).
+    // L'isolation multi-tenant est, elle, réellement émulée ci-dessous.
+    if (normalized.startsWith('SELECT id FROM schema_migrations')) {
+      const rows = MIGRATIONS.map((migration) => ({ id: migration.id })) as R[]
+      return { rows, rowCount: rows.length }
+    }
+    if (normalized.startsWith('INSERT INTO schema_migrations')) {
+      const tbl = tables.get('schema_migrations')!
+      const id = String(values[0])
+      if (tbl.has(id)) return { rows: [], rowCount: 0 }
+      tbl.set(id, { id })
+      return { rows: [], rowCount: 1 }
     }
 
     // SELECT payload_json FROM <table> ...
     const selectPayloadMatch = normalized.match(
-      /^SELECT payload_json FROM ([a-z_]+)/i,
+      /^SELECT payload_json(?:, tenant_id)? FROM ([a-z_]+)/i,
     )
     if (selectPayloadMatch) {
-      const tbl = tables.get(selectPayloadMatch[1])!
-      if (normalized.includes('WHERE id = $1')) {
-        const row = tbl.get(String(values[0]))
+      const table = selectPayloadMatch[1]
+      const tbl = tables.get(table)
+      if (!tbl) throw new Error(`Unknown table ${table}`)
+
+      if (table === 'salon_users') {
+        // Table hors RLS : l'authentification lit tous les salons, les écrans
+        // d'administration filtrent explicitement par tenant.
+        const askedTenant = normalized.includes('WHERE tenant_id = $1')
+        const wanted = askedTenant
+          ? String(values[0])
+          : String(values[1] ?? '')
+        const rows = Array.from(tbl.values())
+          .filter((row) => !askedTenant || row.tenant_id === wanted)
+          .map((row) => ({
+            payload_json: row.payload_json,
+            tenant_id: row.tenant_id,
+          })) as R[]
+        return { rows, rowCount: rows.length }
+      }
+
+      const rows = visibleRows(table)
+      const byId = normalized.match(/WHERE id = \$1/i)
+      if (byId) {
+        const match = rows.find((row) => row.id === String(values[0]))
         return {
-          rows: row ? ([{ payload_json: row.payload_json }] as R[]) : [],
-          rowCount: row ? 1 : 0,
+          rows: match ? ([{ payload_json: match.payload_json }] as R[]) : [],
+          rowCount: match ? 1 : 0,
         }
       }
-      const rows = Array.from(tbl.values()).map((r) => ({
-        payload_json: r.payload_json,
-      })) as R[]
-      return { rows, rowCount: rows.length }
+      return {
+        rows: rows.map((row) => ({ payload_json: row.payload_json })) as R[],
+        rowCount: rows.length,
+      }
     }
 
     // SELECT entity_type, entity_id, deleted_at FROM sync_tombstones
     if (normalized.includes('FROM sync_tombstones')) {
-      const tbl = tables.get('sync_tombstones')!
-      const rows = Array.from(tbl.values()).map((r) => ({
-        entity_type: r.entity_type,
-        entity_id: r.entity_id,
-        deleted_at: r.deleted_at,
+      const rows = visibleRows('sync_tombstones').map((row) => ({
+        entity_type: row.entity_type,
+        entity_id: row.entity_id,
+        deleted_at: row.deleted_at,
       })) as R[]
       return { rows, rowCount: rows.length }
     }
 
-    // INSERT INTO sync_tombstones (entity_type, entity_id, deleted_at)
-    if (normalized.startsWith('INSERT INTO sync_tombstones')) {
-      const tbl = tables.get('sync_tombstones')!
-      const entityType = String(values[0])
-      const entityId = String(values[1])
-      const deletedAt = String(values[2])
-      const key = `${entityType}:${entityId}`
-      const existing = tbl.get(key)
-      if (!existing || deletedAt >= (existing.deleted_at ?? '')) {
-        tbl.set(key, {
-          id: key,
-          entity_type: entityType,
-          entity_id: entityId,
-          deleted_at: deletedAt,
-        })
-      }
-      return { rows: [], rowCount: 1 }
-    }
-
-    // DELETE FROM <table> WHERE id = $1 AND (updated_at|created_at) <= $2::timestamptz
+    // DELETE FROM <table> WHERE id = $1 AND (updated_at|created_at) <= $2
     const deleteMatch = normalized.match(
       /^DELETE FROM ([a-z_]+) WHERE id = \$1 AND (updated_at|created_at) <= \$2/i,
     )
     if (deleteMatch) {
-      const tbl = tables.get(deleteMatch[1])!
+      const table = deleteMatch[1]
       const tsField = deleteMatch[2] as 'updated_at' | 'created_at'
-      const id = String(values[0])
-      const deletedAt = String(values[1])
-      const cur = tbl.get(id)
-      if (cur && (cur[tsField] ?? '') <= deletedAt) {
-        tbl.delete(id)
+      const tbl = tables.get(table)!
+      const key = rowKey(table, String(values[0]))
+      const cur = tbl.get(key)
+      if (cur && (cur[tsField] ?? '') <= String(values[1])) {
+        tbl.delete(key)
         return { rows: [], rowCount: 1 }
       }
       return { rows: [], rowCount: 0 }
     }
 
-    // DELETE FROM <table> WHERE id = $1 (nettoyage direct des enregistrements mocks hérités)
+    // DELETE FROM <table> WHERE id = $1
     const directDeleteMatch = normalized.match(
       /^DELETE FROM ([a-z_]+) WHERE id = \$1$/i,
     )
     if (directDeleteMatch) {
-      const tbl = tables.get(directDeleteMatch[1])!
-      const id = String(values[0])
-      const existed = tbl.delete(id)
+      const table = directDeleteMatch[1]
+      const existed = tables.get(table)!.delete(rowKey(table, String(values[0])))
       return { rows: [], rowCount: existed ? 1 : 0 }
     }
 
-    // INSERT INTO <table> (...) VALUES (...) ON CONFLICT ...
+    // INSERT INTO <table> (...) VALUES (...) [ON CONFLICT ...]
     const insertMatch = normalized.match(
       /^INSERT INTO ([a-z_]+)\s*\(([^)]+)\)/i,
     )
     if (insertMatch) {
-      const tableName = insertMatch[1]
+      const table = insertMatch[1]
       const cols = insertMatch[2].split(',').map((c) => c.trim())
-      const tbl = tables.get(tableName)
-      if (!tbl) throw new Error(`Unknown table ${tableName}`)
+      const tbl = tables.get(table)
+      if (!tbl) throw new Error(`Unknown table ${table}`)
 
       const idIdx = cols.indexOf('id')
       const updatedIdx = cols.indexOf('updated_at')
       const createdIdx = cols.indexOf('created_at')
       const payloadIdx = cols.indexOf('payload_json')
+      const tenantIdx = cols.indexOf('tenant_id')
 
-      const id = String(values[idIdx])
+      const id =
+        idIdx >= 0
+          ? String(values[idIdx])
+          : `${String(values[0])}:${String(values[1])}`
+      const key = rowKey(table, id)
+
+      const explicitTenant =
+        tenantIdx >= 0 ? String(values[tenantIdx]) : currentTenant
+      if (TENANT_SCOPED_TABLES.has(table) && !explicitTenant) {
+        throw new Error(
+          'new row violates row-level security policy (aucun app.tenant_id défini)',
+        )
+      }
+
       const incomingUpdated =
         updatedIdx >= 0 ? String(values[updatedIdx]) : undefined
       const incomingCreated =
         createdIdx >= 0 ? String(values[createdIdx]) : undefined
-      const rawJson = values[payloadIdx]
+      const rawJson = payloadIdx >= 0 ? values[payloadIdx] : undefined
       const parsedPayload =
         typeof rawJson === 'string' ? JSON.parse(rawJson) : rawJson
 
-      const existing = tbl.get(id)
+      const existing = tbl.get(key)
 
-      // ON CONFLICT DO NOTHING (tables immuables)
-      if (normalized.includes('DO NOTHING')) {
-        if (existing) {
-          return { rows: [], rowCount: 0 }
+      // Colonnes scalaires conservées telles quelles (entity_type, deleted_at…)
+      const scalars: Record<string, unknown> = {}
+      cols.forEach((col, index) => {
+        if (col === 'payload_json' || col === 'tenant_id') return
+        const value = values[index]
+        if (
+          value === null ||
+          typeof value === 'string' ||
+          typeof value === 'number' ||
+          typeof value === 'boolean'
+        ) {
+          scalars[col] = value ?? undefined
         }
-        tbl.set(id, {
-          id,
-          created_at: incomingCreated,
-          payload_json: parsedPayload,
-        })
+      })
+
+      const row: StoredRow = {
+        ...scalars,
+        id,
+        tenant_id: explicitTenant ?? undefined,
+        created_at: incomingCreated,
+        updated_at: incomingUpdated,
+        payload_json: parsedPayload,
+      }
+
+      if (normalized.includes('DO NOTHING')) {
+        if (existing) return { rows: [], rowCount: 0 }
+        tbl.set(key, row)
         return { rows: [], rowCount: 1 }
       }
 
-      // ON CONFLICT (id) DO UPDATE ... WHERE <table>.updated_at < EXCLUDED.updated_at
       if (existing && existing.updated_at && incomingUpdated) {
         if (!(existing.updated_at < incomingUpdated)) {
           return { rows: [], rowCount: 0 }
         }
       }
 
-      tbl.set(id, {
-        id,
-        updated_at: incomingUpdated,
-        created_at: incomingCreated,
-        payload_json: parsedPayload,
-      })
+      tbl.set(key, row)
       return { rows: [], rowCount: 1 }
     }
 

@@ -653,20 +653,22 @@ Estimations : **j-h**, 1 développeur senior + assistance IA. `P0` = bloquant s�
 
 ---
 
-## 11. Suivi des correctifs — Sprint 1 (implémenté)
+## 11. Suivi des correctifs — Sprints 1 & 2 (implémentés)
 
-> Mise à jour du 30 octobre 2026, branche `arena/139c7e36-barber-shop`. Le périmètre P0-1 / P0-5 / P0-8 du backlog a été implémenté et validé.
+> Mise à jour du 30 octobre 2026, branche `arena/139c7e36-barber-shop`. Sprint 1 : périmètre P0-1 / P0-5 / P0-8 du backlog. Sprint 2 : P0-2 (isolation multi-tenant + RLS) et P0-4 (migrations versionnées).
 
 ### 11.1 Vulnérabilités traitées
 
 | ID | Statut | Correctif livré |
 |---|---|---|
 | **S1** (critique) — escalade via `/api/sync` | ✅ **Corrigée** | `users` retiré de `buildCloudSyncEnvelope`, ignoré côté serveur (`stripUsersFromSyncPayload`), absent des payloads de pull et de la fusion locale. Routes dédiées `/api/users`, `/api/users/provision`, `PATCH /api/users/:id` réservées au Gérant, avec provisionnement en **création seule** (aucun écrasement de rôle ou de hash). |
+| **S2** (critique) — aucun cloisonnement entre salons | ✅ **Corrigée** | `organizations` → `tenants` → données : `tenant_id` sur les 19 tables, RLS activée **et forcée** sur les 18 tables métier (politique `USING` + `WITH CHECK`), contexte posé par transaction (`set_config('app.tenant_id', …, true)`). Le salon provient du jeton signé (`tid`) ou du serveur, jamais de la requête. Voir §11.4. |
 | **S3** (élevée) — aucune autorisation serveur | 🟡 **Partielle** | Autorisation serveur ajoutée sur toute l'administration des comptes (401 sans session, 403 hors Gérant, rate limit par acteur). L'autorisation **par entité métier** sur `/api/sync*` reste à faire avec la synchronisation delta (P0-3/P0-6). |
-| **S4** (élevée) — sessions non révocables | ❌ **Non traitée** | Nécessite la table `sessions` et le couple access/refresh : reporté au Sprint 2. |
+| **S4** (élevée) — sessions non révocables | ❌ **Non traitée** | Nécessite la table `sessions` et le couple access/refresh : reporté au Sprint 3 (§11.5). |
 | **S5** (élevée) — LWW sur horodatage client | 🟡 **Partielle** | Les mises à jour de comptes utilisent désormais un horodatage serveur strictement croissant ; les données métier restent en LWW client jusqu'à P0-6. |
 | **S6** (moyenne) — bruteforce / politique faible | ✅ **Corrigée** | Rate limiting (5/identité + 30/IP sur 15 min, 10 inscriptions/heure), politique 8 caractères lettre + chiffre côté serveur **et** hors-ligne, buckets réinitialisés après une connexion réussie. |
 | **S7** (moyenne) — secret non persistant en serverless | ✅ **Corrigée** | `SALON_AUTH_SECRET` obligatoire en production (`AUTH_SECRET_MISSING` explicite) ; repli local persistant conservé hors production. |
+| **S8** (élevée) — aucun mécanisme de migration | ✅ **Corrigée** | `server/migrations.ts` : registre `schema_migrations`, migrations `001_baseline` / `002_multi_tenant`, exécution transactionnelle, idempotence testée. Voir §11.4. |
 | **S10** (faible) — en-têtes de sécurité absents | ✅ **Corrigée** | `vercel.json` : CSP, HSTS, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy`, `Permissions-Policy` ; `X-Content-Type-Options` sur toutes les réponses API. |
 | **S11** (faible) — fuites d'information | 🟡 **Partielle** | `/api/health` et `/api/auth/status` conservés pour la compatibilité de l'UI (aucun secret exposé) ; à revoir avec la télémétrie (P1-3). |
 
@@ -681,19 +683,70 @@ Estimations : **j-h**, 1 développeur senior + assistance IA. `P0` = bloquant s�
 
 | Commande | Résultat |
 |---|---|
-| `npm run lint` | 0 erreur, 0 avertissement (107 fichiers) |
-| `npm test` | **61/61** tests verts (12 fichiers, dont 12 nouveaux tests de sécurité) |
+| `npm run lint` | 0 erreur, 0 avertissement (111 fichiers) |
+| `npm test` | **70/70** tests verts (14 fichiers, dont 12 tests de sécurité, 5 tests d'isolation multi-salon et 4 tests de migrations) |
 | `npm run build` | OK |
 
 Nouveaux tests (`src/test/securityHardening.test.ts`) couvrant : injection de comptes dans un payload de sync, absence de comptes dans l'enveloppe client, provisionnement en création seule, refus d'escalade, protection du dernier Gérant, hachage serveur, politique de mot de passe, blocage bruteforce et libération du compteur, secret obligatoire en production.
 
-### 11.4 Reste à faire (Sprint 2)
+### 11.4 Sprint 2 — isolation multi-tenant & migrations (implémenté)
+
+Objectif : rendre le modèle de données réellement multi-salon. Le salon d'appartenance n'est **jamais** lu dans une requête : il provient exclusivement du jeton de session signé (`tid`) ou, en dernier recours, de la configuration serveur (`SALON_DEFAULT_TENANT_ID`).
+
+#### Modèle de tenancy (D1)
+
+| Objet | Rôle |
+|---|---|
+| `organizations` | Entité de facturation (un cabinet comptable peut posséder plusieurs salons) |
+| `tenants` | Un salon : `slug` unique (futur `salonpro.app/salon/<slug>`), fuseau `Africa/Abidjan`, statut `active` |
+| `tenant_id` | Colonne ajoutée sur les **19** tables métier, `NOT NULL`, backfillée vers le salon par défaut, avec `DEFAULT current_setting('app.tenant_id', true)::uuid` |
+| `salon_users` | Également porteur de `tenant_id`, mais **hors RLS** : l'authentification précède la résolution du salon. Unicité `(tenant_id, lower(email))` |
+
+#### Isolation en base (RLS)
+
+- `ENABLE` **et** `FORCE ROW LEVEL SECURITY` sur les **18** tables métier : même le propriétaire des tables est filtré (protège contre les requêtes oubliées).
+- Politique unique `tenant_isolation` : `USING` **et** `WITH CHECK` sur `tenant_id = current_setting('app.tenant_id', true)::uuid` — une écriture vers un autre salon est rejetée, pas seulement invisible.
+- Contexte posé par `withTenantClient()` (`server/tenantContext.ts`) : `BEGIN` → `SELECT set_config('app.tenant_id', $1, true)` → travail → `COMMIT`, avec `ROLLBACK` sur exception. La portée `true` (transaction locale) empêche toute fuite entre requêtes d'une connexion mutualisée.
+- Clés primaires composites `(tenant_id, id)` sur `salon_info` et `app_settings`, dont les identifiants (`salon-main`, `default`) étaient jusqu'ici globaux.
+
+#### Migrations versionnées (P0-4)
+
+- `server/migrations.ts` : registre `schema_migrations`, migrations `001_baseline` (schéma historique) et `002_multi_tenant` (tenancy + RLS).
+- Chaque migration s'exécute dans sa propre transaction ; un échec annule la migration et interrompt la séquence (aucune migration à moitié appliquée).
+- `ensureNeonSchema()` appelle désormais `runMigrations()` : plus de `CREATE TABLE IF NOT EXISTS` dispersé, et les évolutions futures sont additives.
+
+#### Application
+
+- `SessionTokenPayload` porte `tid` ; les jetons historiques sans `tid` sont rattachés au salon par défaut (compatibilité ascendante).
+- `POST /api/sync`, `GET /api/sync/pull`, `POST /api/sync/verify` résolvent le salon depuis la session (`tid`) ou la configuration serveur, puis ouvrent une transaction contextualisée.
+- `GET/POST/PATCH /api/users*` lisent et écrivent strictement dans le salon de la session du Gérant ; une session sans salon exploitable est rejetée (`TENANT_REQUIRED`).
+- Première inscription sur une instance vierge : création automatique d'une organisation + d'un salon, et l'utilisateur en devient le Gérant. Les inscriptions suivantes sans salon sont rattachées au salon par défaut en attente d'approbation (`MANAGER_APPROVAL_REQUIRED`).
+- `loginUserOnNeon` reste volontairement **global** (on ne connaît le salon qu'après identification) puis restreint ses écritures au salon du compte trouvé.
+
+#### Validation
+
+| Commande | Résultat |
+|---|---|
+| `npm run lint` | 0 erreur, 0 avertissement (111 fichiers) |
+| `npm test` | **70/70** tests verts (14 fichiers) |
+| `npm run build` | OK |
+
+Nouveaux tests :
+- `src/test/tenantIsolation.test.ts` (5) — séparation lecture/écriture entre deux salons, impossibilité d'écraser une ligne homonyme d'un autre salon, comptes cloisonnés et e-mail réutilisable d'un salon à l'autre, session historique sans `tid`, et absence de résultat sans contexte (RLS *fail-closed*).
+- `src/test/migrations.test.ts` (4) — identifiants uniques et ordonnés, application unique de chaque migration, contenu du plan de tenancy (19 tables, RLS forcée sur 18, politique `tenant_isolation`, backfill), et arrêt propre en cas d'échec.
+
+#### Limites assumées de cette étape
+
+- Les **membres** (`memberships`) multi-utilisateurs par salon et le changement de salon actif restent à modéliser (P1) : aujourd'hui un compte appartient à un seul salon.
+- L'isolation est validée sur simulateur ; un test d'intégration sur une base Neon réelle (deux salons, deux rôles PostgreSQL) doit être ajouté au pipeline avant la mise en production.
+- `salon_users` repose sur un filtrage applicatif explicite (`WHERE tenant_id = $1`) : toute nouvelle requête sur cette table doit conserver ce filtre.
+
+### 11.5 Reste à faire (Sprint 3)
 
 1. **S4** — table `sessions`, jetons d'accès courts + refresh rotatif, révocation à la déconnexion.
-2. **P0-2** — `organizations`/`tenants`/`memberships`, `tenant_id` + RLS sur les 19 tables.
-3. **P0-4** — migrations versionnées (remplacer `CREATE TABLE IF NOT EXISTS`).
-4. **P0-6** — synchronisation delta serveur-autoritaire (résout S3 côté données et S5 définitivement).
-5. **P0-7** — service worker / mode hors-ligne réel.
+2. **P0-6** — synchronisation delta serveur-autoritaire (résout S3 côté données et S5 définitivement).
+3. **P0-7** — service worker / mode hors-ligne réel.
+4. **P1** — `memberships` (plusieurs utilisateurs/ salons), garde de rôle sur les routes métier, abonnements et limites de plan.
 
 ## Annexe A — Inventaire des fichiers (par rôle)
 

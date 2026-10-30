@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { handleSalonApiRequest } from '../../server/apiHandler'
+import { MIGRATIONS } from '../../server/migrations'
 import {
   hashPasswordNode,
   verifyPasswordNode,
@@ -22,7 +23,10 @@ import {
 } from '../utils/passwordCrypto'
 
 function createAuthMemoryPool(): SqlPoolLike {
-  const users = new Map<string, { updated_at: string; payload_json: unknown }>()
+  const users = new Map<
+    string,
+    { updated_at: string; payload_json: unknown; tenant_id: string }
+  >()
 
   const query = async <R = Record<string, unknown>>(
     text: string,
@@ -33,14 +37,37 @@ function createAuthMemoryPool(): SqlPoolLike {
       norm.startsWith('CREATE TABLE') ||
       norm.startsWith('CREATE INDEX') ||
       norm === 'BEGIN' ||
-      norm === 'COMMIT'
+      norm === 'COMMIT' ||
+      norm === 'ROLLBACK'
     ) {
       return { rows: [], rowCount: 0 }
     }
-    if (norm.startsWith('SELECT payload_json FROM salon_users')) {
-      const rows = Array.from(users.values()).map((u) => ({
-        payload_json: u.payload_json,
-      })) as R[]
+    // Migrations considérées comme déjà appliquées dans ce simulateur ciblé
+    // sur les flux d'authentification (le DDL n'est pas interprété).
+    if (norm.startsWith('SELECT id FROM schema_migrations')) {
+      const rows = MIGRATIONS.map((m) => ({ id: m.id })) as R[]
+      return { rows, rowCount: rows.length }
+    }
+    if (norm.startsWith('INSERT INTO schema_migrations')) {
+      return { rows: [], rowCount: 1 }
+    }
+    if (norm.startsWith('SELECT set_config')) {
+      return { rows: [{}] as R[], rowCount: 1 }
+    }
+    if (
+      norm.startsWith('INSERT INTO organizations') ||
+      norm.startsWith('INSERT INTO tenants')
+    ) {
+      return { rows: [], rowCount: 1 }
+    }
+    if (/^SELECT payload_json(?:, tenant_id)? FROM salon_users/i.test(norm)) {
+      const askedTenant = norm.includes('WHERE tenant_id = $1')
+      const rows = Array.from(users.values())
+        .filter((u) => !askedTenant || u.tenant_id === String(values[0]))
+        .map((u) => ({
+          payload_json: u.payload_json,
+          tenant_id: u.tenant_id,
+        })) as R[]
       return { rows, rowCount: rows.length }
     }
     if (norm.startsWith('SELECT payload_json FROM ')) {
@@ -53,7 +80,12 @@ function createAuthMemoryPool(): SqlPoolLike {
       const id = String(values[0])
       const updatedAt = String(values[9])
       const payload = JSON.parse(String(values[10]))
-      users.set(id, { updated_at: updatedAt, payload_json: payload })
+      const tenantId = values[11] ? String(values[11]) : 'default-tenant'
+      users.set(id, {
+        updated_at: updatedAt,
+        payload_json: payload,
+        tenant_id: tenantId,
+      })
       return { rows: [], rowCount: 1 }
     }
     throw new Error(`SQL non géré : ${norm}`)

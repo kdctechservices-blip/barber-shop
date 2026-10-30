@@ -12,8 +12,18 @@ import type {
   SalonUserAccount,
   UserRole,
 } from '../src/domain/models/index.ts'
-import { verifyManagerPin, type SqlPoolLike } from './neonClient.ts'
+import {
+  verifyManagerPin,
+  type SqlPoolLike,
+  type SqlQueryable,
+} from './neonClient.ts'
 import { ensureNeonSchema, readFullCloudState } from './syncEngine.ts'
+import {
+  DEFAULT_TENANT_ID,
+  isTenantId,
+  resolveDefaultTenantId,
+  withTenantClient,
+} from './tenantContext.ts'
 
 const PBKDF2_ITERATIONS = 100_000
 const KEY_BYTES = 32
@@ -50,6 +60,8 @@ export interface SessionTokenPayload {
   uid: string
   email: string
   role: UserRole
+  /** Salon (tenant) actif — TOUJOURS issu du jeton signé, jamais du client. */
+  tid: string
   exp: number
 }
 
@@ -150,11 +162,13 @@ function getSigningSecret(fallbackSecret?: string): string {
 export function signAuthSessionToken(
   user: Pick<SalonUserAccount, 'id' | 'email' | 'role'>,
   fallbackSecret?: string,
+  tenantId: string = resolveDefaultTenantId(),
 ): string {
   const payload: SessionTokenPayload = {
     uid: user.id,
     email: user.email,
     role: user.role,
+    tid: isTenantId(tenantId) ? tenantId : DEFAULT_TENANT_ID,
     exp: Date.now() + SESSION_TTL_MS,
   }
   const encodedPayload = Buffer.from(JSON.stringify(payload), 'utf8').toString(
@@ -190,6 +204,10 @@ export function verifyAuthSessionToken(
     ) as SessionTokenPayload
     if (!parsed.uid || !parsed.email || !parsed.exp) return null
     if (Date.now() > parsed.exp) return null
+    // Jetons émis avant la migration multi-tenant : rattachés au salon par défaut.
+    if (!isTenantId(parsed.tid)) {
+      parsed.tid = DEFAULT_TENANT_ID
+    }
     return parsed
   } catch {
     return null
@@ -211,15 +229,76 @@ function parseAccountRow(raw: SalonUserAccount | string): SalonUserAccount {
   return typeof raw === 'string' ? (JSON.parse(raw) as SalonUserAccount) : raw
 }
 
+interface TenantAccount {
+  account: SalonUserAccount
+  tenantId: string
+}
+
+/**
+ * Lecture globale (authentification uniquement) : l'identifiant de connexion
+ * peut appartenir à n'importe quel salon. `salon_users` n'est volontairement
+ * pas soumise à RLS (l'authentification précède la connaissance du salon) ;
+ * toute autre lecture est filtrée par `tenant_id`.
+ */
+async function readAccountsGlobal(pool: SqlPoolLike): Promise<TenantAccount[]> {
+  const res = await pool.query<{
+    payload_json: SalonUserAccount | string
+    tenant_id?: string
+  }>('SELECT payload_json, tenant_id FROM salon_users ORDER BY created_at ASC')
+  return res.rows.map((r) => {
+    const account = parseAccountRow(r.payload_json)
+    const tenantId = isTenantId(r.tenant_id)
+      ? r.tenant_id
+      : isTenantId(account.tenantId)
+        ? account.tenantId
+        : resolveDefaultTenantId()
+    return { account, tenantId }
+  })
+}
+
+/** Lecture strictement limitée à un salon. */
+async function readAccountsForTenant(
+  db: SqlQueryable,
+  tenantId: string,
+): Promise<SalonUserAccount[]> {
+  const res = await db.query<{
+    payload_json: SalonUserAccount | string
+    tenant_id?: string
+  }>(
+    'SELECT payload_json, tenant_id FROM salon_users WHERE tenant_id = $1 ORDER BY created_at ASC',
+    [tenantId],
+  )
+  return res.rows
+    .filter((r) => !isTenantId(r.tenant_id) || r.tenant_id === tenantId)
+    .map((r) => parseAccountRow(r.payload_json))
+}
+
+/** Crée l'organisation et le salon d'un nouveau client SaaS. */
+async function createTenantForSalon(
+  pool: SqlPoolLike,
+  salonName: string | undefined,
+): Promise<string> {
+  const tenantId = randomUUID()
+  const organizationId = randomUUID()
+  const name = (salonName ?? '').trim() || 'Mon salon'
+  await pool.query('INSERT INTO organizations (id, name) VALUES ($1, $2)', [
+    organizationId,
+    name,
+  ])
+  await pool.query(
+    `INSERT INTO tenants (id, org_id, slug, name, status)
+     VALUES ($1, $2, $3, $4, 'active')`,
+    [tenantId, organizationId, `salon-${tenantId.slice(0, 8)}`, name],
+  )
+  return tenantId
+}
+
 export async function getNeonAuthStatus(
   pool: SqlPoolLike,
 ): Promise<{ hasUsers: boolean; hasManager: boolean }> {
   await ensureNeonSchema(pool)
-  const res = await pool.query<{ payload_json: SalonUserAccount | string }>(
-    'SELECT payload_json FROM salon_users ORDER BY created_at ASC',
-  )
-  const accounts = res.rows
-    .map((r) => parseAccountRow(r.payload_json))
+  const accounts = (await readAccountsGlobal(pool))
+    .map((entry) => entry.account)
     .filter((u) => u.isActive)
   return {
     hasUsers: accounts.length > 0,
@@ -248,6 +327,7 @@ export async function registerUserOnNeon(
   user: PublicSalonUser
   recordForCache: SalonUserAccount
   sessionToken: string
+  tenantId: string
 }> {
   const fullName = (input.fullName ?? '').trim()
   const email = normalizeEmail(input.email ?? '')
@@ -272,14 +352,35 @@ export async function registerUserOnNeon(
 
   await ensureNeonSchema(pool)
 
-  const existingRes = await pool.query<{
-    payload_json: SalonUserAccount | string
-  }>('SELECT payload_json FROM salon_users ORDER BY created_at ASC')
-  const existingUsers = existingRes.rows.map((r) =>
-    parseAccountRow(r.payload_json),
-  )
+  const globalAccounts = await readAccountsGlobal(pool)
+  const callerTenantId = options?.callerSession?.tid
 
-  if (existingUsers.some((u) => normalizeEmail(u.email) === email)) {
+  let tenantId: string
+  if (isTenantId(callerTenantId)) {
+    // Gérant authentifié : il ajoute un collaborateur à SON salon.
+    tenantId = callerTenantId
+  } else if (globalAccounts.length === 0) {
+    // Tout premier compte du déploiement : création de l'organisation + du salon.
+    tenantId = await createTenantForSalon(pool, input.salonName)
+  } else {
+    // Déploiement déjà initialisé : seule une autorisation Gérant ou le code
+    // serveur permet d'ouvrir un compte supplémentaire.
+    tenantId = resolveDefaultTenantId()
+    const pinCheck = verifyManagerPin(input.managerPin, options?.expectedPin)
+    if (!(pinCheck.pinConfigured && pinCheck.authorized)) {
+      throw new AuthApiError(
+        403,
+        'MANAGER_APPROVAL_REQUIRED',
+        'Un compte existe déjà : connectez-vous en tant que Gérant pour ajouter un collaborateur.',
+      )
+    }
+  }
+
+  const tenantAccounts = globalAccounts
+    .filter((entry) => entry.tenantId === tenantId)
+    .map((entry) => entry.account)
+
+  if (tenantAccounts.some((u) => normalizeEmail(u.email) === email)) {
     throw new AuthApiError(
       409,
       'EMAIL_EXISTS',
@@ -287,7 +388,7 @@ export async function registerUserOnNeon(
     )
   }
 
-  const hasExistingManager = existingUsers.some(
+  const hasExistingManager = tenantAccounts.some(
     (u) => u.isActive && u.role === 'manager',
   )
 
@@ -299,9 +400,10 @@ export async function registerUserOnNeon(
     )
   }
 
-  // Si un Gérant existe déjà, l'ajout d'un compte exige une session Gérant active (ou un code serveur SALON_SYNC_PIN configuré)
   if (hasExistingManager) {
-    const isManagerCaller = options?.callerSession?.role === 'manager'
+    const isManagerCaller =
+      options?.callerSession?.role === 'manager' &&
+      options.callerSession.tid === tenantId
     const pinCheck = verifyManagerPin(input.managerPin, options?.expectedPin)
     const pinOk = pinCheck.pinConfigured && pinCheck.authorized
     if (!isManagerCaller && !pinOk) {
@@ -325,33 +427,38 @@ export async function registerUserOnNeon(
     lastLoginAt: nowIso,
     createdAt: nowIso,
     updatedAt: nowIso,
+    tenantId,
   }
 
-  await pool.query(
-    `INSERT INTO salon_users (id, email, full_name, phone, role, password_hash, is_active, last_login_at, created_at, updated_at, payload_json)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)`,
-    [
-      account.id,
-      account.email,
-      account.fullName,
-      account.phone ?? null,
-      account.role,
-      account.passwordHash,
-      account.isActive,
-      account.lastLoginAt ?? null,
-      account.createdAt,
-      account.updatedAt,
-      JSON.stringify(account),
-    ],
-  )
+  await withTenantClient(pool, tenantId, async (client) => {
+    await client.query(
+      `INSERT INTO salon_users (id, email, full_name, phone, role, password_hash, is_active, last_login_at, created_at, updated_at, payload_json, tenant_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)`,
+      [
+        account.id,
+        account.email,
+        account.fullName,
+        account.phone ?? null,
+        account.role,
+        account.passwordHash,
+        account.isActive,
+        account.lastLoginAt ?? null,
+        account.createdAt,
+        account.updatedAt,
+        JSON.stringify(account),
+        tenantId,
+      ],
+    )
 
-  // Purge persistante immédiate de toute donnée mock éventuelle en base Cloud pour ce compte réel
-  await readFullCloudState(pool)
+    // Purge persistante immédiate de toute donnée mock éventuelle pour ce salon.
+    await readFullCloudState(client, tenantId)
+  })
 
   return {
     user: toPublicUser(account),
     recordForCache: account,
-    sessionToken: signAuthSessionToken(account, options?.expectedPin),
+    sessionToken: signAuthSessionToken(account, options?.expectedPin, tenantId),
+    tenantId,
   }
 }
 
@@ -403,6 +510,7 @@ export async function loginUserOnNeon(
   user: PublicSalonUser
   recordForCache: SalonUserAccount
   sessionToken: string
+  tenantId: string
 }> {
   const identifier = (input.email ?? '').trim()
   const password = input.password ?? ''
@@ -417,16 +525,14 @@ export async function loginUserOnNeon(
 
   await ensureNeonSchema(pool)
 
-  const res = await pool.query<{ payload_json: SalonUserAccount | string }>(
-    'SELECT payload_json FROM salon_users ORDER BY created_at ASC',
+  const candidates = (await readAccountsGlobal(pool)).filter((entry) =>
+    matchesNeonAccountIdentifier(entry.account, identifier),
   )
-  const candidates = res.rows
-    .map((r) => parseAccountRow(r.payload_json))
-    .filter((u) => matchesNeonAccountIdentifier(u, identifier))
 
-  const account = candidates.find((u) =>
-    verifyPasswordNode(password, u.passwordHash),
+  const matched = candidates.find((entry) =>
+    verifyPasswordNode(password, entry.account.passwordHash),
   )
+  const account = matched?.account
 
   if (!account) {
     throw new AuthApiError(
@@ -444,43 +550,53 @@ export async function loginUserOnNeon(
     )
   }
 
+  const tenantId = matched?.tenantId ?? resolveDefaultTenantId()
   const nowIso = new Date().toISOString()
   const updatedAccount: SalonUserAccount = {
     ...account,
     lastLoginAt: nowIso,
     updatedAt: nowIso,
+    tenantId,
   }
 
-  await pool.query(
-    `INSERT INTO salon_users (id, email, full_name, phone, role, password_hash, is_active, last_login_at, created_at, updated_at, payload_json)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
-     ON CONFLICT (id) DO UPDATE SET
-       last_login_at = EXCLUDED.last_login_at,
-       updated_at = EXCLUDED.updated_at,
-       payload_json = EXCLUDED.payload_json
-     WHERE EXCLUDED.updated_at > salon_users.updated_at`,
-    [
-      updatedAccount.id,
-      updatedAccount.email,
-      updatedAccount.fullName,
-      updatedAccount.phone ?? null,
-      updatedAccount.role,
-      updatedAccount.passwordHash,
-      updatedAccount.isActive,
-      updatedAccount.lastLoginAt ?? null,
-      updatedAccount.createdAt,
-      updatedAccount.updatedAt,
-      JSON.stringify(updatedAccount),
-    ],
-  )
+  await withTenantClient(pool, tenantId, async (client) => {
+    await client.query(
+      `INSERT INTO salon_users (id, email, full_name, phone, role, password_hash, is_active, last_login_at, created_at, updated_at, payload_json, tenant_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)
+       ON CONFLICT (id) DO UPDATE SET
+         last_login_at = EXCLUDED.last_login_at,
+         updated_at = EXCLUDED.updated_at,
+         payload_json = EXCLUDED.payload_json,
+         tenant_id = EXCLUDED.tenant_id
+       WHERE EXCLUDED.updated_at > salon_users.updated_at`,
+      [
+        updatedAccount.id,
+        updatedAccount.email,
+        updatedAccount.fullName,
+        updatedAccount.phone ?? null,
+        updatedAccount.role,
+        updatedAccount.passwordHash,
+        updatedAccount.isActive,
+        updatedAccount.lastLoginAt ?? null,
+        updatedAccount.createdAt,
+        updatedAccount.updatedAt,
+        JSON.stringify(updatedAccount),
+        tenantId,
+      ],
+    )
 
-  // Purge persistante immédiate de toute donnée mock éventuelle en base Cloud lors de la connexion
-  await readFullCloudState(pool)
+    await readFullCloudState(client, tenantId)
+  })
 
   return {
     user: toPublicUser(updatedAccount),
     recordForCache: updatedAccount,
-    sessionToken: signAuthSessionToken(updatedAccount, options?.expectedPin),
+    sessionToken: signAuthSessionToken(
+      updatedAccount,
+      options?.expectedPin,
+      tenantId,
+    ),
+    tenantId,
   }
 }
 
@@ -510,11 +626,19 @@ function assertManagerActor(actor: SessionTokenPayload | null | undefined): void
   }
 }
 
-async function readAllAccounts(pool: SqlPoolLike): Promise<SalonUserAccount[]> {
-  const res = await pool.query<{ payload_json: SalonUserAccount | string }>(
-    'SELECT payload_json FROM salon_users ORDER BY created_at ASC',
-  )
-  return res.rows.map((r) => parseAccountRow(r.payload_json))
+function assertTenantActor(
+  actor: SessionTokenPayload | null | undefined,
+): string {
+  assertManagerActor(actor)
+  const tenantId = actor?.tid
+  if (!isTenantId(tenantId)) {
+    throw new AuthApiError(
+      400,
+      'TENANT_REQUIRED',
+      'Aucun salon actif dans la session : reconnectez-vous.',
+    )
+  }
+  return tenantId
 }
 
 function isIsoDate(value: unknown): value is string {
@@ -544,17 +668,19 @@ export async function provisionUsersOnNeon(
   input: { accounts?: unknown },
   actor: SessionTokenPayload | null | undefined,
 ): Promise<UserProvisioningResult> {
-  assertManagerActor(actor)
+  const tenantId = assertTenantActor(actor)
   await ensureNeonSchema(pool)
 
   const rawAccounts = Array.isArray(input.accounts) ? input.accounts : []
-  const existing = await readAllAccounts(pool)
-  const existingIds = new Set(existing.map((u) => u.id))
-  const existingEmails = new Set(existing.map((u) => normalizeEmail(u.email)))
-
   let created = 0
   let skipped = 0
   let invalid = 0
+
+  const existing = await withTenantClient(pool, tenantId, (client) =>
+    readAccountsForTenant(client, tenantId),
+  )
+  const existingIds = new Set(existing.map((u) => u.id))
+  const existingEmails = new Set(existing.map((u) => normalizeEmail(u.email)))
 
   for (const raw of rawAccounts.slice(0, 200)) {
     if (!raw || typeof raw !== 'object') {
@@ -611,27 +737,31 @@ export async function provisionUsersOnNeon(
         : undefined,
       createdAt,
       updatedAt,
+      tenantId,
     }
 
     try {
-      await pool.query(
-        `INSERT INTO salon_users (id, email, full_name, phone, role, password_hash, is_active, last_login_at, created_at, updated_at, payload_json)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
-         ON CONFLICT (id) DO NOTHING`,
-        [
-          account.id,
-          account.email,
-          account.fullName,
-          account.phone ?? null,
-          account.role,
-          account.passwordHash,
-          account.isActive,
-          account.lastLoginAt ?? null,
-          account.createdAt,
-          account.updatedAt,
-          JSON.stringify(account),
-        ],
-      )
+      await withTenantClient(pool, tenantId, async (client) => {
+        await client.query(
+          `INSERT INTO salon_users (id, email, full_name, phone, role, password_hash, is_active, last_login_at, created_at, updated_at, payload_json, tenant_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)
+           ON CONFLICT (id) DO NOTHING`,
+          [
+            account.id,
+            account.email,
+            account.fullName,
+            account.phone ?? null,
+            account.role,
+            account.passwordHash,
+            account.isActive,
+            account.lastLoginAt ?? null,
+            account.createdAt,
+            account.updatedAt,
+            JSON.stringify(account),
+            tenantId,
+          ],
+        )
+      })
       created += 1
       existingIds.add(account.id)
       existingEmails.add(account.email)
@@ -648,9 +778,12 @@ export async function listUsersOnNeon(
   pool: SqlPoolLike,
   actor: SessionTokenPayload | null | undefined,
 ): Promise<PublicSalonUser[]> {
-  assertManagerActor(actor)
+  const tenantId = assertTenantActor(actor)
   await ensureNeonSchema(pool)
-  return (await readAllAccounts(pool)).map(toPublicUser)
+  const accounts = await withTenantClient(pool, tenantId, (client) =>
+    readAccountsForTenant(client, tenantId),
+  )
+  return accounts.map(toPublicUser)
 }
 
 export interface UpdateUserInput {
@@ -671,10 +804,12 @@ export async function updateUserOnNeon(
   input: UpdateUserInput,
   actor: SessionTokenPayload | null | undefined,
 ): Promise<PublicSalonUser> {
-  assertManagerActor(actor)
+  const tenantId = assertTenantActor(actor)
   await ensureNeonSchema(pool)
 
-  const accounts = await readAllAccounts(pool)
+  const accounts = await withTenantClient(pool, tenantId, (client) =>
+    readAccountsForTenant(client, tenantId),
+  )
   const target = accounts.find((u) => u.id === targetUserId)
   if (!target) {
     throw new AuthApiError(404, 'USER_NOT_FOUND', 'Compte introuvable.')
@@ -747,36 +882,41 @@ export async function updateUserOnNeon(
     isActive: nextIsActive,
     passwordHash: nextPasswordHash,
     updatedAt,
+    tenantId,
   }
 
-  await pool.query(
-    `INSERT INTO salon_users (id, email, full_name, phone, role, password_hash, is_active, last_login_at, created_at, updated_at, payload_json)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
-     ON CONFLICT (id) DO UPDATE SET
-       email = EXCLUDED.email,
-       full_name = EXCLUDED.full_name,
-       phone = EXCLUDED.phone,
-       role = EXCLUDED.role,
-       password_hash = EXCLUDED.password_hash,
-       is_active = EXCLUDED.is_active,
-       last_login_at = EXCLUDED.last_login_at,
-       updated_at = EXCLUDED.updated_at,
-       payload_json = EXCLUDED.payload_json
-     WHERE EXCLUDED.updated_at > salon_users.updated_at`,
-    [
-      updated.id,
-      updated.email,
-      updated.fullName,
-      updated.phone ?? null,
-      updated.role,
-      updated.passwordHash,
-      updated.isActive,
-      updated.lastLoginAt ?? null,
-      updated.createdAt,
-      updated.updatedAt,
-      JSON.stringify(updated),
-    ],
-  )
+  await withTenantClient(pool, tenantId, async (client) => {
+    await client.query(
+      `INSERT INTO salon_users (id, email, full_name, phone, role, password_hash, is_active, last_login_at, created_at, updated_at, payload_json, tenant_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)
+       ON CONFLICT (id) DO UPDATE SET
+         email = EXCLUDED.email,
+         full_name = EXCLUDED.full_name,
+         phone = EXCLUDED.phone,
+         role = EXCLUDED.role,
+         password_hash = EXCLUDED.password_hash,
+         is_active = EXCLUDED.is_active,
+         last_login_at = EXCLUDED.last_login_at,
+         updated_at = EXCLUDED.updated_at,
+         payload_json = EXCLUDED.payload_json,
+         tenant_id = EXCLUDED.tenant_id
+       WHERE EXCLUDED.updated_at > salon_users.updated_at`,
+      [
+        updated.id,
+        updated.email,
+        updated.fullName,
+        updated.phone ?? null,
+        updated.role,
+        updated.passwordHash,
+        updated.isActive,
+        updated.lastLoginAt ?? null,
+        updated.createdAt,
+        updated.updatedAt,
+        JSON.stringify(updated),
+        tenantId,
+      ],
+    )
+  })
 
   return toPublicUser(updated)
 }
