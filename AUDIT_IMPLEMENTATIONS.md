@@ -627,6 +627,7 @@ Estimations : **j-h**, 1 développeur senior + assistance IA. `P0` = bloquant s�
 - P0-2, P0-4, P0-6, P0-7.
 - Livrables : `organizations/tenants/memberships`, RLS sur 19 tables, migration des bases existantes, sync delta, PWA hors-ligne.
 - Critère de sortie : deux salons de démonstration totalement isolés (test automatisé) ; rechargement hors-ligne fonctionnel.
+- *Exécution réelle* : P0-2 et P0-4 (sprint 2), S4 (sprint 3), P0-6 (sprint 4), P0-7 (sprint 5). `memberships` reste ouvert — voir §11.10.
 
 ### Sprint 3 — « Monétisable » (3 semaines)
 
@@ -653,9 +654,9 @@ Estimations : **j-h**, 1 développeur senior + assistance IA. `P0` = bloquant s�
 
 ---
 
-## 11. Suivi des correctifs — Sprints 1 à 4 (implémentés)
+## 11. Suivi des correctifs — Sprints 1 à 5 (implémentés)
 
-> Mise à jour du 30 octobre 2026, branche `arena/139c7e36-barber-shop`. Sprint 1 : périmètre P0-1 / P0-5 / P0-8 du backlog. Sprint 2 : P0-2 (isolation multi-tenant + RLS) et P0-4 (migrations versionnées). Sprint 3 : S4 (sessions révocables). Sprint 4 : P0-6 (synchronisation delta serveur-autoritaire).
+> Mise à jour du 30 octobre 2026, branche `arena/139c7e36-barber-shop`. Sprint 1 : périmètre P0-1 / P0-5 / P0-8 du backlog. Sprint 2 : P0-2 (isolation multi-tenant + RLS) et P0-4 (migrations versionnées). Sprint 3 : S4 (sessions révocables). Sprint 4 : P0-6 (synchronisation delta serveur-autoritaire). Sprint 5 : P0-7 (service worker hors-ligne).
 
 ### 11.1 Vulnérabilités traitées
 
@@ -839,10 +840,49 @@ Nouveaux tests :
 - La granularité du delta est **la ligne**, pas le champ : deux appareils qui modifient deux champs différents de la même ligne gardent le dernier reçu (résolution « dernière écriture reçue »).
 - Un push reste un instantané complet côté client : le suivi des seules lignes modifiées (dirty tracking) réduira encore la charge réseau (P1).
 
-### 11.8 Reste à faire
 
-1. **P0-7** — service worker / mode hors-ligne réel.
-2. **P1** — `memberships` multi-salons, garde de rôle sur les routes métier, abonnements et limites de plan, purge des sessions et du journal de synchronisation, écran « appareils connectés », dirty tracking côté client.
+### 11.9 Sprint 5 — service worker hors-ligne (implémenté)
+
+#### Constat
+
+Jusqu'ici l'application ne s'ouvrait **pas** hors-ligne : aucune ressource n'était mise en cache. Une coupure réseau au démarrage (fréquent en Côte d'Ivoire) rendait l'écran blanc, alors même que toutes les données étaient déjà dans IndexedDB.
+
+#### Ce qui est livré
+
+| Élément | Détail |
+|---|---|
+| Génération du SW | Plugin Vite `server/pwaPlugin.ts` : après le build, `dist/sw.js` est écrit avec la liste réelle des fichiers produits et une version dérivée de leur contenu (FNV-1a) |
+| Précache | 36 fichiers / ~1,5 Mo : coquille `index.html`, tous les bundles hachés, images, manifeste et icône. Précache **tolérant** : un fichier manquant ne bloque pas l'installation |
+| Navigation | Réseau d'abord (fraîcheur), repli sur la coquille en cache — le routeur React reprend la main, l'application se charge même sans réseau |
+| Statiques | Cache d'abord (noms hachés = immuables), mise en cache à la première récupération |
+| API | **Jamais** interceptée ni mise en cache : les données métier restent dans IndexedDB et la synchronisation delta (P0-6) garde son rôle. Requêtes non-GET et origines tierces également ignorées |
+| Mise à jour | Nouvelle version en `waiting`, activée sur demande (`SKIP_WAITING`) puis rechargement — aucune saisie n'est interrompue |
+| Enregistrement | `src/pwa/registerServiceWorker.ts`, appelé depuis `main.tsx` : désactivé en développement (HMR) et dans tout environnement sans `serviceWorker` |
+| Diffusion | `vercel.json` : `sw.js` en `max-age=0, must-revalidate` + `Service-Worker-Allowed: /` ; `/assets/*` en `immutable` (un an) |
+
+#### Validation
+
+| Commande | Résultat |
+|---|---|
+| `npm run lint` | 0 erreur, 0 avertissement (119 fichiers) |
+| `npm test` | **93/93** tests verts (17 fichiers) |
+| `npm run build` | OK — `sw.js` généré (36 fichiers, 1 542 Ko) |
+| `vite preview` | `/`, `/sw.js` et `/manifest.webmanifest` répondent 200 |
+
+`src/test/offlineServiceWorker.test.ts` (11 tests) exécute la **source réelle** du service worker dans un bac à sable (`self`, `caches`, `fetch`) : précache complet, purge des anciens caches, `clients.claim`, coquille servie hors-ligne, mise à jour de la coquille, cache-first des statiques, non-interception de `/api/*`, des POST et des origines tierces, activation sur `SKIP_WAITING`, et no-op de l'enregistrement en développement.
+
+#### Limites assumées
+
+- Le service worker ne met **pas** en file les écritures faites hors-ligne vers l'API : la continuité est assurée par IndexedDB et rejouée à la reconnexion par la synchronisation delta (choix explicite : pas de « Background Sync » opaque).
+- Pas encore d'invite utilisateur « nouvelle version disponible » : le mécanisme existe (`onUpdateReady`), l'UI reste à brancher (P1).
+- Le précache est entièrement re-téléchargé à chaque nouvelle version (pas de cache partiel par fichier) : suffisant à cette taille, à optimiser si l'application grossit.
+
+### 11.10 Reste à faire
+
+1. **P1** — `memberships` multi-salons, garde de rôle sur les routes métier, abonnements et limites de plan.
+2. **P1** — maintenance : purge des sessions expirées et du journal `sync_changes`, écran « appareils connectés », invite de mise à jour PWA.
+3. **P2** — dirty tracking côté client (payloads réduits), notifications WhatsApp/SMS, CRM/fidélité.
+
 
 
 ## Annexe A — Inventaire des fichiers (par rôle)

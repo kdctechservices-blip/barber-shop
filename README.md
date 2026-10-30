@@ -41,7 +41,7 @@
    SALON_DEFAULT_TENANT_ID="00000000-0000-0000-0000-000000000001"
    ```
    > **Sécurité** : Ne préfixez jamais ces variables par `VITE_`. Elles sont lues uniquement côté serveur (`server/viteApiPlugin.ts` en local et `api/[...route].ts` sur Vercel).
-2. Le schéma PostgreSQL est **versionné** (`server/migrations.ts`) et appliqué automatiquement au premier appel : `schema_migrations` enregistre les migrations `001_baseline` (schéma historique, 19 tables), `002_multi_tenant` (organisations, salons, `tenant_id` + RLS), `003_sessions` (sessions révocables) puis `004_sync_revisions` (journal de synchronisation delta). Chaque migration s'exécute dans sa propre transaction et n'est jamais rejouée. `db/schema.sql` reste la référence lisible du schéma de base.
+2. Le schéma PostgreSQL est **versionné** (`server/migrations.ts`) et appliqué automatiquement au premier appel : `schema_migrations` enregistre les migrations `001_baseline` (schéma historique, 19 tables), `002_multi_tenant` (organisations, salons, `tenant_id` + RLS), `003_sessions` (sessions révocables) puis `004_sync_revisions` (journal de synchronisation delta). Le service worker (`dist/sw.js`) est généré par le build, pas par les migrations. Chaque migration s'exécute dans sa propre transaction et n'est jamais rejouée. `db/schema.sql` reste la référence lisible du schéma de base.
 3. Dans l'application, ouvrez **Paramètres → Cloud Neon** puis cliquez sur **Activer la synchronisation Neon**.
 
 ### 3.1 Multi-salon : isolation et salon actif
@@ -61,7 +61,17 @@
 - Un push **sans curseur** (appareil qui n'a pas encore récupéré l'état serveur) voit ses lignes plus anciennes écartées : impossible d'écraser des données récentes avec une copie périmée.
 - Côté navigateur, `mergeCloudDelta()` n'applique que les tables reçues et respecte les suppressions ; le curseur est conservé dans `localStorage`.
 
-### 3.3 Sécurité, rôles et administration des comptes
+### 3.3 Mode hors-ligne réel (service worker)
+
+- Après le premier chargement, l'application s'ouvre **sans réseau** : la coquille et tous les bundles sont précachés par `dist/sw.js`, généré à chaque build (liste réelle des fichiers + version dérivée de leur contenu).
+- Navigation : réseau d'abord, repli sur la coquille en cache. Ressources statiques : cache d'abord (noms hachés immuables).
+- **L'API n'est jamais mise en cache** : les données métier vivent dans IndexedDB et remontent via la synchronisation delta dès le retour du réseau.
+- Nouvelle version : elle attend en arrière-plan et s'active sur demande, sans interrompre une saisie.
+- Le service worker est désactivé en développement (aucune interférence avec le HMR).
+
+> Vérifier le mode hors-ligne : `npm run build && npm run preview`, ouvrir l'application, puis couper le réseau (DevTools → Network → Offline) et recharger.
+
+### 3.4 Sécurité, rôles et administration des comptes
 
 - **`SALON_AUTH_SECRET` est obligatoire en production** (Vercel). Sans lui, chaque instance serverless signerait les sessions avec un secret différent et déconnecterait les utilisateurs. Génération : `openssl rand -hex 32`.
 - **Les comptes utilisateurs ne transitent jamais par la synchronisation.** Un payload `SALON_PRO_BACKUP_V1` ne peut donc ni créer, ni promouvoir, ni réécrire un compte (rôle ou hash de mot de passe). Toute administration passe par des routes dédiées, réservées à une session **Gérant** :
