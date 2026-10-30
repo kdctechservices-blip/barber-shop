@@ -9,6 +9,7 @@ import {
 import type { LocalSyncTombstone } from '../db/repositories/salonRepositories'
 import type { SalonBackupPayload } from '../domain/models'
 import { useSalonStore } from '../hooks/salonStoreContext'
+import { fetchWithSession, readStoredSessionTokens } from '../lib/sessionClient'
 import { useToast } from '../hooks/toastContext'
 import { CloudSyncContext, type CloudSyncStatus } from './cloudSyncContext'
 
@@ -121,26 +122,13 @@ export function CloudSyncProvider({ children }: { children: ReactNode }) {
         const envelope = await syncWithRepo((repo) =>
           repo.buildCloudSyncEnvelope(),
         )
-        const savedSessionToken = (() => {
-          try {
-            return (
-              window.sessionStorage.getItem('salon_pro_auth_token_session') ??
-              window.localStorage.getItem('salon_pro_auth_token_local') ??
-              ''
-            )
-          } catch {
-            return ''
-          }
-        })()
+        const savedSessionToken = readStoredSessionTokens().sessionToken ?? ''
 
-        const resp = await window.fetch('/api/sync', {
+        // `fetchWithSession` rafraîchit automatiquement un jeton d'accès expiré
+        // (rotation S4) avant de rejouer la requête.
+        const resp = await fetchWithSession('/api/sync', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(savedSessionToken
-              ? { Authorization: `Bearer ${savedSessionToken}` }
-              : {}),
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(envelope),
         })
 
@@ -198,12 +186,9 @@ export function CloudSyncProvider({ children }: { children: ReactNode }) {
               repo.buildUserProvisioningEnvelope(),
             )
             if (provisioning.accounts.length > 0) {
-              await window.fetch('/api/users/provision', {
+              await fetchWithSession('/api/users/provision', {
                 method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  Authorization: `Bearer ${savedSessionToken}`,
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(provisioning),
               })
             }

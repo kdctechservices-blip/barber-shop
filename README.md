@@ -41,7 +41,7 @@
    SALON_DEFAULT_TENANT_ID="00000000-0000-0000-0000-000000000001"
    ```
    > **Sécurité** : Ne préfixez jamais ces variables par `VITE_`. Elles sont lues uniquement côté serveur (`server/viteApiPlugin.ts` en local et `api/[...route].ts` sur Vercel).
-2. Le schéma PostgreSQL est **versionné** (`server/migrations.ts`) et appliqué automatiquement au premier appel : `schema_migrations` enregistre les migrations `001_baseline` (schéma historique, 19 tables) puis `002_multi_tenant` (organisations, salons, `tenant_id` + RLS). Chaque migration s'exécute dans sa propre transaction et n'est jamais rejouée. `db/schema.sql` reste la référence lisible du schéma de base.
+2. Le schéma PostgreSQL est **versionné** (`server/migrations.ts`) et appliqué automatiquement au premier appel : `schema_migrations` enregistre les migrations `001_baseline` (schéma historique, 19 tables), `002_multi_tenant` (organisations, salons, `tenant_id` + RLS) puis `003_sessions` (sessions révocables). Chaque migration s'exécute dans sa propre transaction et n'est jamais rejouée. `db/schema.sql` reste la référence lisible du schéma de base.
 3. Dans l'application, ouvrez **Paramètres → Cloud Neon** puis cliquez sur **Activer la synchronisation Neon**.
 
 ### 3.1 Multi-salon : isolation et salon actif
@@ -65,6 +65,7 @@
 - **Garde-fous serveur** : impossible de retirer le rôle ou de désactiver le **dernier Gérant actif**, ni de désactiver son propre compte.
 - **Politique de mot de passe** : 8 caractères minimum, avec au moins une lettre et un chiffre (appliquée côté serveur **et** en mode hors-ligne).
 - **Anti-bruteforce** : 5 tentatives échouées par identifiant et par IP sur 15 minutes, 30 tentatives par IP, 10 créations de compte par heure.
+- **Sessions révocables** : le jeton d'accès est signé et ne dure que **15 minutes** ; il porte l'identifiant de session (`sid`) vérifié en base à chaque requête. Le **jeton de rafraîchissement** (opaque, stocké haché, durée 30 jours) est **à usage unique** : chaque rafraîchissement le fait tourner. Rejouer un jeton déjà consommé révoque toutes les sessions du compte. La déconnexion (`POST /api/auth/logout`) révoque la session immédiatement. Côté navigateur, `src/lib/sessionClient.ts` rafraîchit automatiquement avant expiration et rejoue la requête en cas de 401.
 - **En-têtes de sécurité** (CSP, HSTS, `X-Frame-Options`, `nosniff`, `Referrer-Policy`, `Permissions-Policy`) configurés dans `vercel.json`.
 - La synchronisation machine sans session (`SALON_SYNC_PIN`) reste possible pour compatibilité, mais elle est **dépréciée** et ne donne aucun accès à l'administration des comptes.
 

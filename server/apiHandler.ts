@@ -4,7 +4,9 @@ import {
   getNeonAuthStatus,
   listUsersOnNeon,
   loginUserOnNeon,
+  logoutUserSession,
   provisionUsersOnNeon,
+  refreshUserSession,
   registerUserOnNeon,
   updateUserOnNeon,
   verifyAuthSessionToken,
@@ -31,6 +33,7 @@ import {
   syncWithNeonDatabase,
   type CloudSyncEnvelope,
 } from './syncEngine.ts'
+import { isSessionActive } from './sessions.ts'
 import { resolveDefaultTenantId, withTenantClient } from './tenantContext.ts'
 
 export interface ApiHandlerOptions {
@@ -226,8 +229,41 @@ export async function handleSalonApiRequest(
     return true
   }
   const clientIp = extractClientIp(req)
+  const sessionMetadata = {
+    userAgent:
+      typeof req.headers['user-agent'] === 'string'
+        ? req.headers['user-agent']
+        : null,
+    ip: clientIp,
+  }
 
   // 2. Routes publiques d'authentification (/api/auth/*)
+  // Les jetons d'accès porteurs d'un `sid` sont vérifiés en base à chaque
+  // requête : une session révoquée (déconnexion, vol de jeton) cesse d'être
+  // utilisable immédiatement, sans attendre l'expiration (audit S4).
+  if (callerSession?.sid && pool && !pathname.startsWith('/api/auth/')) {
+    let active = false
+    try {
+      active = await isSessionActive(pool, callerSession.sid)
+    } catch (err) {
+      const formatted = formatDbError(err)
+      sendJson(res, formatted.status, {
+        ok: false,
+        code: formatted.code,
+        message: formatted.message,
+      })
+      return true
+    }
+    if (!active) {
+      sendJson(res, 401, {
+        ok: false,
+        code: 'SESSION_REVOKED',
+        message: 'Session close ou expirée : reconnectez-vous.',
+      })
+      return true
+    }
+  }
+
   if (pathname.startsWith('/api/auth/')) {
     if (!pool) {
       sendJson(res, 503, {
@@ -276,6 +312,7 @@ export async function handleSalonApiRequest(
         const result = await registerUserOnNeon(pool, body, {
           expectedPin,
           callerSession,
+          metadata: sessionMetadata,
         })
         sendJson(res, 201, {
           ok: true,
@@ -327,7 +364,7 @@ export async function handleSalonApiRequest(
           result = await loginUserOnNeon(
             pool,
             { email: body.email ?? '', password: body.password ?? '' },
-            { expectedPin },
+            { expectedPin, metadata: sessionMetadata },
           )
         } catch (err) {
           // Seuls les échecs alimentent la limitation (pas les succès).
@@ -340,6 +377,61 @@ export async function handleSalonApiRequest(
           ok: true,
           ...result,
         })
+      } catch (err) {
+        const formatted = formatDbError(err)
+        sendJson(res, formatted.status, {
+          ok: false,
+          code: formatted.code,
+          message: formatted.message,
+        })
+      }
+      return true
+    }
+
+    if (pathname === '/api/auth/refresh' && req.method === 'POST') {
+      try {
+        const refreshLimit = consumeRateLimit(
+          `refresh:${clientIp}`,
+          RATE_LIMITS.refreshPerIp,
+        )
+        if (
+          rejectWhenRateLimited(
+            res,
+            refreshLimit,
+            'Trop de rafraîchissements de session depuis cet appareil. Réessayez dans quelques minutes.',
+          )
+        ) {
+          return true
+        }
+        const body = (await readJsonBody(req)) as { refreshToken?: string }
+        const result = await refreshUserSession(
+          pool,
+          body.refreshToken ?? '',
+          { expectedPin, metadata: sessionMetadata },
+        )
+        sendJson(res, 200, { ok: true, ...result })
+      } catch (err) {
+        const formatted = formatDbError(err)
+        sendJson(res, formatted.status, {
+          ok: false,
+          code: formatted.code,
+          message: formatted.message,
+        })
+      }
+      return true
+    }
+
+    if (pathname === '/api/auth/logout' && req.method === 'POST') {
+      try {
+        const body = (await readJsonBody(req)) as { refreshToken?: string }
+        const { revoked } = await logoutUserSession(pool, {
+          sessionId: callerSession?.sid,
+          refreshToken:
+            typeof body.refreshToken === 'string' && body.refreshToken
+              ? body.refreshToken
+              : undefined,
+        })
+        sendJson(res, 200, { ok: true, revoked })
       } catch (err) {
         const formatted = formatDbError(err)
         sendJson(res, formatted.status, {

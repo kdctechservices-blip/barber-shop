@@ -50,13 +50,10 @@ const TENANT_SCOPED_TABLES = new Set([
   'sync_tombstones',
 ])
 
-const ALL_TABLE_NAMES = [
-  ...TENANT_SCOPED_TABLES,
-  'salon_users',
-  'organizations',
-  'tenants',
-  'schema_migrations',
-]
+/** Hors RLS : l'authentification précède la connaissance du salon. */
+const GLOBAL_TABLES = ['salon_users', 'organizations', 'tenants', 'sessions', 'schema_migrations']
+
+const ALL_TABLE_NAMES = [...TENANT_SCOPED_TABLES, ...GLOBAL_TABLES]
 
 export function createInMemoryNeonPool(options?: { failNetwork?: boolean }): {
   pool: SqlPoolLike
@@ -68,6 +65,62 @@ export function createInMemoryNeonPool(options?: { failNetwork?: boolean }): {
   }
 
   let currentTenant: string | null = null
+
+  type Condition = {
+    column: string
+    op: 'is-null' | 'is-not-null' | '=' | '>' | '<' | '>=' | '<='
+    value?: unknown
+  }
+
+  const parseConditions = (clause: string, values: unknown[]): Condition[] =>
+    clause.split(/\s+AND\s+/i).map((part) => {
+      const trimmed = part.trim()
+      const isNull = trimmed.match(/^([a-z_]+)\s+IS\s+NULL$/i)
+      if (isNull) return { column: isNull[1], op: 'is-null' }
+      const isNotNull = trimmed.match(/^([a-z_]+)\s+IS\s+NOT\s+NULL$/i)
+      if (isNotNull) return { column: isNotNull[1], op: 'is-not-null' }
+      const comparison = trimmed.match(/^([a-z_]+)\s*(>=|<=|=|>|<)\s*\$(\d+)$/i)
+      if (!comparison) {
+        throw new Error(`Condition SQL non gérée : ${trimmed}`)
+      }
+      return {
+        column: comparison[1],
+        op: comparison[2] as '=' | '>' | '<' | '>=' | '<=',
+        value: values[Number(comparison[3]) - 1],
+      }
+    })
+
+  const asComparable = (value: unknown): number | string => {
+    if (value === null || value === undefined) return ''
+    if (typeof value === 'number') return value
+    const asDate = Date.parse(String(value))
+    return Number.isNaN(asDate) ? String(value) : asDate
+  }
+
+  const matchesConditions = (row: StoredRow, conditions: Condition[]): boolean =>
+    conditions.every((condition) => {
+      const raw = (row as unknown as Record<string, unknown>)[condition.column]
+      if (condition.op === 'is-null' || condition.op === 'is-not-null') {
+        const isNull = raw === null || raw === undefined
+        return condition.op === 'is-null' ? isNull : !isNull
+      }
+      const left = asComparable(raw)
+      const right = asComparable(condition.value)
+      switch (condition.op) {
+        case '=':
+          return left === right
+        case '>':
+          return left > right
+        case '<':
+          return left < right
+        case '>=':
+          return left >= right
+        case '<=':
+          return left <= right
+        default:
+          return false
+      }
+    })
   const rowKey = (table: string, id: string): string => {
     if (!TENANT_SCOPED_TABLES.has(table)) return id
     if (!currentTenant) return `∅::${id}`
@@ -132,6 +185,51 @@ export function createInMemoryNeonPool(options?: { failNetwork?: boolean }): {
       if (tbl.has(id)) return { rows: [], rowCount: 0 }
       tbl.set(id, { id })
       return { rows: [], rowCount: 1 }
+    }
+
+    // Table `sessions` (S4) : lecture/écriture générique pilotée par les
+    // colonnes et conditions réellement utilisées par server/sessions.ts.
+    if (/^SELECT\s/i.test(normalized) && /\bFROM sessions\b/i.test(normalized)) {
+      const match = normalized.match(
+        /^SELECT (.+?) FROM sessions(?: WHERE (.+?))?(?: ORDER BY .*)?$/i,
+      )
+      if (!match) throw new Error(`Requête sessions non gérée : ${normalized}`)
+      const columns = match[1].split(',').map((c) => c.trim())
+      const conditions = match[2] ? parseConditions(match[2], values) : []
+      const rows = Array.from(tables.get('sessions')!.values())
+        .filter((row) => matchesConditions(row, conditions))
+        .map((row) => {
+          const projected: Record<string, unknown> = {}
+          for (const column of columns) {
+            projected[column] = (row as unknown as Record<string, unknown>)[column]
+          }
+          return projected as R
+        })
+      return { rows, rowCount: rows.length }
+    }
+
+    if (/^UPDATE sessions\b/i.test(normalized)) {
+      const match = normalized.match(/^UPDATE sessions SET (.+?) WHERE (.+)$/i)
+      if (!match) throw new Error(`UPDATE sessions non géré : ${normalized}`)
+      const assignments = match[1].split(',').map((assignment) => {
+        const parsed = assignment.trim().match(/^([a-z_]+)\s*=\s*\$(\d+)$/i)
+        if (!parsed) {
+          throw new Error(`Assignation SQL non gérée : ${assignment}`)
+        }
+        return { column: parsed[1], value: values[Number(parsed[2]) - 1] }
+      })
+      const conditions = parseConditions(match[2], values)
+      let rowCount = 0
+      for (const [key, row] of tables.get('sessions')!) {
+        if (!matchesConditions(row, conditions)) continue
+        const updated = { ...row } as unknown as Record<string, unknown>
+        for (const assignment of assignments) {
+          updated[assignment.column] = assignment.value
+        }
+        tables.get('sessions')!.set(key, updated as unknown as StoredRow)
+        rowCount += 1
+      }
+      return { rows: [], rowCount }
     }
 
     // SELECT payload_json FROM <table> ...
@@ -324,9 +422,9 @@ export async function invokeApi(params: {
   reqEmitter.headers = Object.fromEntries(
     Object.entries(params.headers ?? {}).map(([k, v]) => [k.toLowerCase(), v]),
   )
-  if (params.body !== undefined) {
-    reqEmitter.body = params.body
-  }
+  // Toujours renseigner `body` (même vide) : sinon `readJsonBody` attendrait
+  // indéfiniment l'événement `end`, que ce faux flux n'émet jamais.
+  reqEmitter.body = params.body ?? {}
 
   let statusCode = 200
   let rawResponse = ''

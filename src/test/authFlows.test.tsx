@@ -27,6 +27,8 @@ function createAuthMemoryPool(): SqlPoolLike {
     string,
     { updated_at: string; payload_json: unknown; tenant_id: string }
   >()
+  // Sessions révocables (S4) — colonnes utilisées par server/sessions.ts
+  const sessions = new Map<string, Record<string, unknown>>()
 
   const query = async <R = Record<string, unknown>>(
     text: string,
@@ -87,6 +89,62 @@ function createAuthMemoryPool(): SqlPoolLike {
         tenant_id: tenantId,
       })
       return { rows: [], rowCount: 1 }
+    }
+    if (norm.startsWith('INSERT INTO sessions')) {
+      const columns = norm
+        .slice(
+          norm.indexOf('(') + 1,
+          norm.indexOf(')'),
+        )
+        .split(',')
+        .map((c) => c.trim())
+      const row: Record<string, unknown> = {}
+      columns.forEach((column, index) => {
+        row[column] = values[index] ?? null
+      })
+      sessions.set(String(row.id), row)
+      return { rows: [], rowCount: 1 }
+    }
+    if (norm.includes('FROM sessions')) {
+      const byId = norm.match(/WHERE id = \$1/)
+      const wanted = byId
+        ? String(values[0])
+        : String(values.find((v) => typeof v === 'string' && v.length === 64) ?? '')
+      const rows = Array.from(sessions.values()).filter((row) =>
+        byId
+          ? row.id === wanted
+          : row.refresh_token_hash === wanted,
+      )
+      if (norm.startsWith('SELECT id ')) {
+        const live = rows.filter(
+          (row) =>
+            !row.revoked_at &&
+            Date.parse(String(row.expires_at)) > Date.now(),
+        )
+        return {
+          rows: live.map((row) => ({ id: row.id })) as R[],
+          rowCount: live.length,
+        }
+      }
+      return {
+        rows: rows.map((row) => ({ ...row })) as R[],
+        rowCount: rows.length,
+      }
+    }
+    if (norm.startsWith('UPDATE sessions')) {
+      const revokedAt = String(values[1] ?? values[2] ?? new Date().toISOString())
+      let rowCount = 0
+      for (const row of sessions.values()) {
+        const matchesHash =
+          String(row.refresh_token_hash) === String(values[0])
+        const matchesId = String(row.id) === String(values[0])
+        if ((matchesHash || matchesId) && !row.revoked_at) {
+          row.revoked_at = revokedAt
+          row.revoked_reason = String(values[2] ?? values[3] ?? 'logout')
+          rowCount += 1
+        }
+      }
+      return { rows: [], rowCount }
     }
     throw new Error(`SQL non géré : ${norm}`)
   }

@@ -171,4 +171,6 @@ export const RATE_LIMITS = {
   registerPerIp: { max: 10, windowMs: 60 * 60_000, blockMs: 60 * 60_000 },
   /** 60 opérations d'administration de comptes par heure et par utilisateur. */
   userAdminPerActor: { max: 60, windowMs: 60 * 60_000, blockMs: 15 * 60_000 },
+  /** 120 rafraîchissements de session par IP et par quart d'heure. */
+  refreshPerIp: { max: 120, windowMs: 15 * 60_000, blockMs: 5 * 60_000 },
 } as const satisfies Record<string, RateLimitRule>

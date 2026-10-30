@@ -112,6 +112,37 @@ CREATE INDEX IF NOT EXISTS salon_users_tenant_created_idx
   ON salon_users (tenant_id, created_at);
 `
 
+
+/**
+ * Sessions révocables (S4).
+ *
+ * Table hors RLS : retrouver une session à partir d'un jeton de rafraîchissement
+ * précède la connaissance du salon. Le `tenant_id` stocké est toujours vérifié
+ * applicativement. Le jeton lui-même n'est jamais stocké : seule son empreinte
+ * SHA-256 l'est.
+ */
+export const SESSIONS_SQL = `
+CREATE TABLE IF NOT EXISTS sessions (
+  id uuid PRIMARY KEY,
+  tenant_id uuid NOT NULL,
+  user_id text NOT NULL,
+  email text NOT NULL,
+  role text NOT NULL,
+  refresh_token_hash text NOT NULL UNIQUE,
+  created_at timestamptz NOT NULL,
+  expires_at timestamptz NOT NULL,
+  last_used_at timestamptz,
+  revoked_at timestamptz,
+  revoked_reason text,
+  replaced_by uuid,
+  user_agent text,
+  ip text
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (tenant_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions (expires_at);
+`
+
 export const MIGRATIONS: Migration[] = [
   {
     id: '001_baseline',
@@ -122,6 +153,11 @@ export const MIGRATIONS: Migration[] = [
     id: '002_multi_tenant',
     label: 'Organisations, salons et isolation RLS',
     sql: TENANCY_SQL,
+  },
+  {
+    id: '003_sessions',
+    label: 'Sessions révocables et jetons de rafraîchissement',
+    sql: SESSIONS_SQL,
   },
 ]
 

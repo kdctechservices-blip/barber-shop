@@ -7,6 +7,7 @@
 -- Le schéma appliqué en production est piloté par server/migrations.ts.
 -- La migration 002_multi_tenant y ajoute organizations, tenants, tenant_id
 -- sur les 19 tables et les politiques RLS tenant_isolation.
+-- La migration 003_sessions y ajoute la table sessions (jetons révocables).
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS salon_info (

@@ -653,9 +653,9 @@ Estimations : **j-h**, 1 développeur senior + assistance IA. `P0` = bloquant s�
 
 ---
 
-## 11. Suivi des correctifs — Sprints 1 & 2 (implémentés)
+## 11. Suivi des correctifs — Sprints 1, 2 & 3 (implémentés)
 
-> Mise à jour du 30 octobre 2026, branche `arena/139c7e36-barber-shop`. Sprint 1 : périmètre P0-1 / P0-5 / P0-8 du backlog. Sprint 2 : P0-2 (isolation multi-tenant + RLS) et P0-4 (migrations versionnées).
+> Mise à jour du 30 octobre 2026, branche `arena/139c7e36-barber-shop`. Sprint 1 : périmètre P0-1 / P0-5 / P0-8 du backlog. Sprint 2 : P0-2 (isolation multi-tenant + RLS) et P0-4 (migrations versionnées). Sprint 3 : S4 (sessions révocables).
 
 ### 11.1 Vulnérabilités traitées
 
@@ -664,7 +664,7 @@ Estimations : **j-h**, 1 développeur senior + assistance IA. `P0` = bloquant s�
 | **S1** (critique) — escalade via `/api/sync` | ✅ **Corrigée** | `users` retiré de `buildCloudSyncEnvelope`, ignoré côté serveur (`stripUsersFromSyncPayload`), absent des payloads de pull et de la fusion locale. Routes dédiées `/api/users`, `/api/users/provision`, `PATCH /api/users/:id` réservées au Gérant, avec provisionnement en **création seule** (aucun écrasement de rôle ou de hash). |
 | **S2** (critique) — aucun cloisonnement entre salons | ✅ **Corrigée** | `organizations` → `tenants` → données : `tenant_id` sur les 19 tables, RLS activée **et forcée** sur les 18 tables métier (politique `USING` + `WITH CHECK`), contexte posé par transaction (`set_config('app.tenant_id', …, true)`). Le salon provient du jeton signé (`tid`) ou du serveur, jamais de la requête. Voir §11.4. |
 | **S3** (élevée) — aucune autorisation serveur | 🟡 **Partielle** | Autorisation serveur ajoutée sur toute l'administration des comptes (401 sans session, 403 hors Gérant, rate limit par acteur). L'autorisation **par entité métier** sur `/api/sync*` reste à faire avec la synchronisation delta (P0-3/P0-6). |
-| **S4** (élevée) — sessions non révocables | ❌ **Non traitée** | Nécessite la table `sessions` et le couple access/refresh : reporté au Sprint 3 (§11.5). |
+| **S4** (élevée) — sessions non révocables | ✅ **Corrigée** | Table `sessions` (migration `003_sessions`), jeton d'accès signé de 15 min porteur du claim `sid`, jeton de rafraîchissement opaque haché en base, rotation à usage unique, détection de rejeu révoquant toute la famille, révocation immédiate à la déconnexion. Voir §11.6. |
 | **S5** (élevée) — LWW sur horodatage client | 🟡 **Partielle** | Les mises à jour de comptes utilisent désormais un horodatage serveur strictement croissant ; les données métier restent en LWW client jusqu'à P0-6. |
 | **S6** (moyenne) — bruteforce / politique faible | ✅ **Corrigée** | Rate limiting (5/identité + 30/IP sur 15 min, 10 inscriptions/heure), politique 8 caractères lettre + chiffre côté serveur **et** hors-ligne, buckets réinitialisés après une connexion réussie. |
 | **S7** (moyenne) — secret non persistant en serverless | ✅ **Corrigée** | `SALON_AUTH_SECRET` obligatoire en production (`AUTH_SECRET_MISSING` explicite) ; repli local persistant conservé hors production. |
@@ -741,12 +741,55 @@ Nouveaux tests :
 - L'isolation est validée sur simulateur ; un test d'intégration sur une base Neon réelle (deux salons, deux rôles PostgreSQL) doit être ajouté au pipeline avant la mise en production.
 - `salon_users` repose sur un filtrage applicatif explicite (`WHERE tenant_id = $1`) : toute nouvelle requête sur cette table doit conserver ce filtre.
 
-### 11.5 Reste à faire (Sprint 3)
+### 11.5 Sprint 3 — sessions révocables (implémenté)
 
-1. **S4** — table `sessions`, jetons d'accès courts + refresh rotatif, révocation à la déconnexion.
-2. **P0-6** — synchronisation delta serveur-autoritaire (résout S3 côté données et S5 définitivement).
-3. **P0-7** — service worker / mode hors-ligne réel.
-4. **P1** — `memberships` (plusieurs utilisateurs/ salons), garde de rôle sur les routes métier, abonnements et limites de plan.
+#### Modèle de session
+
+| Élément | Choix retenu |
+|---|---|
+| Jeton d'accès | Jeton HMAC signé, **15 minutes**, claim `sid` (session) + `tid` (salon). Vérifié en base à chaque requête authentifiée : une session révoquée cesse immédiatement de fonctionner |
+| Jeton de rafraîchissement | Chaîne opaque de 256 bits, **stockée uniquement hachée** (SHA-256) : une fuite de la base ne permet pas de rejouer les sessions. Durée de vie 30 jours |
+| Rotation | Chaque rafraîchissement révoque la session précédente et en émet une nouvelle. Fenêtre de grâce de 30 s pour absorber une réponse perdue (réseau mobile) |
+| Détection de vol | Rejouer un jeton déjà consommé (hors grâce) révoque **toutes** les sessions vivantes du compte (`SESSION_REUSED`) |
+| Déconnexion | `POST /api/auth/logout` révoque la session immédiatement (`revoked_at`, `revoked_reason`), de façon idempotente |
+| Traçabilité | `sessions` conserve `user_agent`, `ip`, `created_at`, `last_used_at`, `revoked_reason` — base de l'écran « appareils connectés » (P1) |
+
+#### Nouvelles routes
+
+| Route | Méthode | Rôle | Réponse |
+|---|---|---|---|
+| `/api/auth/refresh` | `POST` | public (jeton de rafraîchissement) | `sessionToken`, `refreshToken`, `expiresAt`, `user` ; rate limit 120/quart d'heure par IP |
+| `/api/auth/logout` | `POST` | session ou jeton de rafraîchissement | `{ revoked }`, toujours 200 (idempotent) |
+
+`/api/auth/login` et `/api/auth/register` renvoient désormais `sessionToken` (15 min), `refreshToken`, `sessionId`, `expiresAt` et `refreshExpiresAt`.
+
+#### Comportement client
+
+- `src/lib/sessionClient.ts` centralise le stockage des deux jetons (session/local selon « Se souvenir de moi »), le rafraîchissement **avec verrou anti-concurrence** (une seule rotation à la fois, sinon plusieurs 401 simultanés révoqueraient la famille), et la révocation à la déconnexion.
+- `fetchWithSession()` rejoue une requête en 401 après une rotation réussie : la synchronisation Cloud et le provisionnement de comptes survivent à l'expiration du jeton d'accès de 15 min.
+- Rotation planifiée 60 s avant expiration, plus un rafraîchissement au retour d'onglet.
+
+#### Validation
+
+| Commande | Résultat |
+|---|---|
+| `npm run lint` | 0 erreur, 0 avertissement (114 fichiers) |
+| `npm test` | **76/76** tests verts (15 fichiers) |
+| `npm run build` | OK |
+
+`src/test/sessions.test.ts` (6 tests) couvre : émission d'un jeton court avec `sid`, rotation effective du jeton de rafraîchissement, révocation de toute la famille sur rejeu, refus immédiat d'un jeton d'accès après déconnexion, jetons inconnus/vides, et idempotence de la déconnexion.
+
+#### Limites assumées
+
+- Les jetons émis **avant** ce déploiement (sans `sid`) restent valides jusqu'à leur expiration (30 jours) et échappent donc à la révocation : à échéance, plus aucun jeton sans session ne circule.
+- La table `sessions` n'est pas purgée automatiquement (les lignes expirées s'accumulent) : une tâche `DELETE FROM sessions WHERE expires_at < now() - interval '30 days'` est à planifier avec les sauvegardes (P1).
+- L'écran d'administration des appareils connectés et la révocation ciblée par le Gérant restent à construire (P1).
+
+### 11.6 Reste à faire
+
+1. **P0-6** — synchronisation delta serveur-autoritaire (résout S3 côté données et S5 définitivement).
+2. **P0-7** — service worker / mode hors-ligne réel.
+3. **P1** — `memberships` (plusieurs salons par utilisateur), garde de rôle sur les routes métier, abonnements et limites de plan, purge des sessions expirées, écran « appareils connectés ».
 
 ## Annexe A — Inventaire des fichiers (par rôle)
 

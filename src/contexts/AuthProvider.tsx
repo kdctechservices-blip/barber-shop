@@ -8,6 +8,16 @@ import {
 import type { PublicSalonUser, SalonUserAccount } from '../domain/models'
 import { useSalonStore } from '../hooks/salonStoreContext'
 import {
+  AUTH_TOKEN_LOCAL_KEY,
+  AUTH_TOKEN_SESSION_KEY,
+  clearStoredSessionTokens,
+  readStoredSessionTokens,
+  refreshAuthSession,
+  revokeSessionOnServer,
+  scheduleSessionRefresh,
+  storeSessionTokens,
+} from '../lib/sessionClient'
+import {
   AuthContext,
   type AuthMode,
   type LoginAccountParams,
@@ -16,8 +26,7 @@ import {
 
 export const AUTH_USER_LOCAL_KEY = 'salon_pro_auth_user_local'
 export const AUTH_USER_SESSION_KEY = 'salon_pro_auth_user_session'
-export const AUTH_TOKEN_LOCAL_KEY = 'salon_pro_auth_token_local'
-export const AUTH_TOKEN_SESSION_KEY = 'salon_pro_auth_token_session'
+export { AUTH_TOKEN_LOCAL_KEY, AUTH_TOKEN_SESSION_KEY }
 
 function purgeLegacyStoredPins(): void {
   try {
@@ -31,25 +40,23 @@ function purgeLegacyStoredPins(): void {
 function readPersistedAuth(): {
   user: PublicSalonUser | null
   token: string | null
+  refreshToken: string | null
 } {
   purgeLegacyStoredPins()
   try {
     const rawSession = window.sessionStorage.getItem(AUTH_USER_SESSION_KEY)
     const rawLocal = window.localStorage.getItem(AUTH_USER_LOCAL_KEY)
     const rawUser = rawSession ?? rawLocal
-    const token =
-      window.sessionStorage.getItem(AUTH_TOKEN_SESSION_KEY) ??
-      window.localStorage.getItem(AUTH_TOKEN_LOCAL_KEY) ??
-      null
+    const { sessionToken: token, refreshToken } = readStoredSessionTokens()
 
-    if (!rawUser) return { user: null, token: null }
+    if (!rawUser) return { user: null, token: null, refreshToken: null }
     const parsed = JSON.parse(rawUser) as PublicSalonUser
     if (!parsed?.id || !parsed?.email || !parsed?.role) {
-      return { user: null, token: null }
+      return { user: null, token: null, refreshToken: null }
     }
-    return { user: parsed, token }
+    return { user: parsed, token, refreshToken }
   } catch {
-    return { user: null, token: null }
+    return { user: null, token: null, refreshToken: null }
   }
 }
 
@@ -57,23 +64,18 @@ function persistAuthSession(
   user: PublicSalonUser,
   token: string | null,
   rememberMe: boolean,
+  refreshToken: string | null = null,
 ): void {
   purgeLegacyStoredPins()
   try {
     const serialized = JSON.stringify(user)
     window.sessionStorage.setItem(AUTH_USER_SESSION_KEY, serialized)
-    if (token) {
-      window.sessionStorage.setItem(AUTH_TOKEN_SESSION_KEY, token)
-    }
     if (rememberMe) {
       window.localStorage.setItem(AUTH_USER_LOCAL_KEY, serialized)
-      if (token) {
-        window.localStorage.setItem(AUTH_TOKEN_LOCAL_KEY, token)
-      }
     } else {
       window.localStorage.removeItem(AUTH_USER_LOCAL_KEY)
-      window.localStorage.removeItem(AUTH_TOKEN_LOCAL_KEY)
     }
+    storeSessionTokens({ sessionToken: token, refreshToken }, rememberMe)
   } catch {
     // ignore storage errors
   }
@@ -83,12 +85,11 @@ function clearPersistedAuthSession(): void {
   purgeLegacyStoredPins()
   try {
     window.sessionStorage.removeItem(AUTH_USER_SESSION_KEY)
-    window.sessionStorage.removeItem(AUTH_TOKEN_SESSION_KEY)
     window.localStorage.removeItem(AUTH_USER_LOCAL_KEY)
-    window.localStorage.removeItem(AUTH_TOKEN_LOCAL_KEY)
   } catch {
     // ignore storage errors
   }
+  clearStoredSessionTokens()
 }
 
 class ServerBusinessAuthError extends Error {}
@@ -199,6 +200,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             user?: PublicSalonUser
             recordForCache?: SalonUserAccount
             sessionToken?: string
+            refreshToken?: string
           }
 
           if (resp.ok && data.ok && data.user) {
@@ -226,7 +228,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             setSessionToken(nextToken)
             setHasAnyManager(true)
             setAuthMode('cloud_neon')
-            persistAuthSession(data.user, nextToken, rememberMe)
+            persistAuthSession(
+              data.user,
+              nextToken,
+              rememberMe,
+              data.refreshToken ?? null,
+            )
             return data.user
           }
 
@@ -305,6 +312,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             user?: PublicSalonUser
             recordForCache?: SalonUserAccount
             sessionToken?: string
+            refreshToken?: string
           }
 
           if (resp.ok && data.ok && data.user) {
@@ -320,7 +328,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             setCurrentUser(data.user)
             setSessionToken(nextToken)
             setAuthMode('cloud_neon')
-            persistAuthSession(data.user, nextToken, rememberMe)
+            persistAuthSession(
+              data.user,
+              nextToken,
+              rememberMe,
+              data.refreshToken ?? null,
+            )
             return data.user
           }
 
@@ -383,10 +396,42 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   )
 
   const logout = useCallback(() => {
+    // Révocation immédiate côté serveur (la session ne survit pas à la déconnexion).
+    void revokeSessionOnServer()
     clearPersistedAuthSession()
     setCurrentUser(null)
     setSessionToken(null)
   }, [])
+
+  // Rotation automatique du jeton d'accès avant expiration (15 min).
+  useEffect(() => {
+    if (!sessionToken) return undefined
+    return scheduleSessionRefresh(
+      (session) => {
+        setSessionToken(session.sessionToken)
+      },
+      () => {
+        clearPersistedAuthSession()
+        setCurrentUser(null)
+        setSessionToken(null)
+      },
+    )
+  }, [sessionToken])
+
+  // Si l'onglet redevient actif avec un jeton expiré, on rafraîchit tout de suite.
+  useEffect(() => {
+    if (typeof window === 'undefined' || !sessionToken) return undefined
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return
+      const { sessionToken: stored } = readStoredSessionTokens()
+      if (!stored) return
+      void refreshAuthSession().then((session) => {
+        if (session) setSessionToken(session.sessionToken)
+      })
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [sessionToken])
 
   const value = useMemo(
     () => ({

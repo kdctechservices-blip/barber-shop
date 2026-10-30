@@ -24,6 +24,15 @@ import {
   resolveDefaultTenantId,
   withTenantClient,
 } from './tenantContext.ts'
+import {
+  ACCESS_TOKEN_TTL_MS,
+  createSession,
+  findSessionByRefreshToken,
+  revokeAllSessionsForUser,
+  revokeSessionById,
+  revokeSessionByRefreshToken,
+  type SessionMetadata,
+} from './sessions.ts'
 
 const PBKDF2_ITERATIONS = 100_000
 const KEY_BYTES = 32
@@ -62,6 +71,8 @@ export interface SessionTokenPayload {
   role: UserRole
   /** Salon (tenant) actif — TOUJOURS issu du jeton signé, jamais du client. */
   tid: string
+  /** Session serveur (S4) : permet la révocation immédiate, absente des jetons hérités. */
+  sid?: string
   exp: number
 }
 
@@ -163,13 +174,15 @@ export function signAuthSessionToken(
   user: Pick<SalonUserAccount, 'id' | 'email' | 'role'>,
   fallbackSecret?: string,
   tenantId: string = resolveDefaultTenantId(),
+  options?: { sessionId?: string; ttlMs?: number },
 ): string {
   const payload: SessionTokenPayload = {
     uid: user.id,
     email: user.email,
     role: user.role,
     tid: isTenantId(tenantId) ? tenantId : DEFAULT_TENANT_ID,
-    exp: Date.now() + SESSION_TTL_MS,
+    ...(options?.sessionId ? { sid: options.sessionId } : {}),
+    exp: Date.now() + (options?.ttlMs ?? SESSION_TTL_MS),
   }
   const encodedPayload = Buffer.from(JSON.stringify(payload), 'utf8').toString(
     'base64url',
@@ -322,6 +335,7 @@ export async function registerUserOnNeon(
   options?: {
     expectedPin?: string
     callerSession?: SessionTokenPayload | null
+    metadata?: SessionMetadata
   },
 ): Promise<{
   user: PublicSalonUser
@@ -457,8 +471,8 @@ export async function registerUserOnNeon(
   return {
     user: toPublicUser(account),
     recordForCache: account,
-    sessionToken: signAuthSessionToken(account, options?.expectedPin, tenantId),
     tenantId,
+    ...(await issueAuthSession(pool, account, tenantId, options)),
   }
 }
 
@@ -505,13 +519,12 @@ function matchesNeonAccountIdentifier(
 export async function loginUserOnNeon(
   pool: SqlPoolLike,
   input: { email: string; password: string },
-  options?: { expectedPin?: string },
+  options?: { expectedPin?: string; metadata?: SessionMetadata },
 ): Promise<{
   user: PublicSalonUser
   recordForCache: SalonUserAccount
-  sessionToken: string
   tenantId: string
-}> {
+} & IssuedAuthSession> {
   const identifier = (input.email ?? '').trim()
   const password = input.password ?? ''
 
@@ -591,13 +604,162 @@ export async function loginUserOnNeon(
   return {
     user: toPublicUser(updatedAccount),
     recordForCache: updatedAccount,
-    sessionToken: signAuthSessionToken(
-      updatedAccount,
-      options?.expectedPin,
-      tenantId,
-    ),
     tenantId,
+    ...(await issueAuthSession(pool, updatedAccount, tenantId, options)),
   }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Sessions révocables (S4)                                                    */
+/* -------------------------------------------------------------------------- */
+
+/** Fenêtre tolérée après rotation (réponse perdue) avant de considérer un rejeu comme un vol. */
+const ROTATION_GRACE_MS = 30_000
+
+export interface IssuedAuthSession {
+  sessionToken: string
+  refreshToken: string
+  sessionId: string
+  /** Expiration du jeton d'accès (epoch ms). */
+  expiresAt: number
+  /** Expiration du jeton de rafraîchissement (epoch ms). */
+  refreshExpiresAt: number
+}
+
+async function issueAuthSession(
+  pool: SqlPoolLike,
+  account: SalonUserAccount,
+  tenantId: string,
+  options?: { expectedPin?: string; metadata?: SessionMetadata },
+): Promise<IssuedAuthSession> {
+  const session = await createSession(
+    pool,
+    {
+      id: account.id,
+      email: account.email,
+      role: account.role === 'manager' ? 'manager' : 'cashier',
+      tenantId,
+    },
+    options?.metadata ?? {},
+  )
+  return {
+    sessionToken: signAuthSessionToken(account, options?.expectedPin, tenantId, {
+      sessionId: session.sessionId,
+      ttlMs: ACCESS_TOKEN_TTL_MS,
+    }),
+    refreshToken: session.refreshToken,
+    sessionId: session.sessionId,
+    expiresAt: session.accessExpiresAt,
+    refreshExpiresAt: session.refreshExpiresAt,
+  }
+}
+
+/**
+ * Rafraîchit une session : vérifie le jeton, recharge le compte (rôle et
+ * activation à jour), révoque l'ancienne session et en émet une nouvelle.
+ * Le jeton de rafraîchissement est à usage unique (rotation).
+ */
+export async function refreshUserSession(
+  pool: SqlPoolLike,
+  refreshToken: string,
+  options?: { expectedPin?: string; metadata?: SessionMetadata },
+): Promise<
+  { user: PublicSalonUser; tenantId: string } & IssuedAuthSession
+> {
+  const token = (refreshToken ?? '').trim()
+  if (!token) {
+    throw new AuthApiError(
+      400,
+      'MISSING_REFRESH_TOKEN',
+      'Jeton de rafraîchissement manquant.',
+    )
+  }
+
+  await ensureNeonSchema(pool)
+  const session = await findSessionByRefreshToken(pool, token)
+
+  if (!session) {
+    throw new AuthApiError(
+      401,
+      'INVALID_REFRESH_TOKEN',
+      'Session inconnue ou déjà close : reconnectez-vous.',
+    )
+  }
+
+  const revokedAt = session.revoked_at ? Date.parse(session.revoked_at) : 0
+  if (session.revoked_at) {
+    const isRecentRotation =
+      session.revoked_reason === 'rotated' &&
+      Number.isFinite(revokedAt) &&
+      Date.now() - revokedAt <= ROTATION_GRACE_MS
+    if (!isRecentRotation) {
+      // Rejeu d'un jeton déjà consommé : vol probable, on coupe toute la famille.
+      await revokeAllSessionsForUser(
+        pool,
+        session.tenant_id,
+        session.user_id,
+        'refresh_reuse',
+      )
+      throw new AuthApiError(
+        401,
+        'SESSION_REUSED',
+        'Jeton de session déjà utilisé. Toutes les sessions de ce compte ont été révoquées par sécurité.',
+      )
+    }
+  }
+
+  if (Date.parse(session.expires_at) <= Date.now()) {
+    await revokeSessionById(pool, session.id, 'expired')
+    throw new AuthApiError(
+      401,
+      'SESSION_EXPIRED',
+      'Session expirée : reconnectez-vous.',
+    )
+  }
+
+  const tenantId = isTenantId(session.tenant_id)
+    ? session.tenant_id
+    : DEFAULT_TENANT_ID
+  const accounts = await readAccountsForTenant(pool, tenantId)
+  const account = accounts.find((entry) => entry.id === session.user_id)
+
+  if (!account) {
+    await revokeSessionById(pool, session.id, 'account_missing')
+    throw new AuthApiError(
+      401,
+      'SESSION_INVALID',
+      'Compte introuvable pour cette session : reconnectez-vous.',
+    )
+  }
+  if (!account.isActive) {
+    await revokeSessionById(pool, session.id, 'account_disabled')
+    throw new AuthApiError(
+      403,
+      'ACCOUNT_DISABLED',
+      'Ce compte a été désactivé par le Gérant.',
+    )
+  }
+
+  await revokeSessionById(pool, session.id, 'rotated')
+  const issued = await issueAuthSession(pool, account, tenantId, options)
+
+  return { user: toPublicUser(account), tenantId, ...issued }
+}
+
+/** Révocation immédiate (déconnexion), idempotente. */
+export async function logoutUserSession(
+  pool: SqlPoolLike,
+  input: { sessionId?: string; refreshToken?: string },
+): Promise<{ revoked: number }> {
+  let revoked = 0
+  if (input.sessionId) {
+    revoked += await revokeSessionById(pool, input.sessionId, 'logout')
+  }
+  if (input.refreshToken) {
+    revoked += await revokeSessionByRefreshToken(pool, input.refreshToken, 'logout')
+  }
+  return { revoked }
 }
 
 /* -------------------------------------------------------------------------- */
