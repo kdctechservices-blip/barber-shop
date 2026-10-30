@@ -29,6 +29,10 @@ function createAuthMemoryPool(): SqlPoolLike {
   >()
   // Sessions révocables (S4) — colonnes utilisées par server/sessions.ts
   const sessions = new Map<string, Record<string, unknown>>()
+  // Multi-salon + facturation (Sprint 6/7) : salon -> organisation, abonnements
+  const tenants = new Map<string, string>()
+  const membershipRows: { tenant_id: string; is_active: boolean }[] = []
+  const subscriptions = new Map<string, Record<string, unknown>>()
 
   const query = async <R = Record<string, unknown>>(
     text: string,
@@ -56,10 +60,85 @@ function createAuthMemoryPool(): SqlPoolLike {
     if (norm.startsWith('SELECT set_config')) {
       return { rows: [{}] as R[], rowCount: 1 }
     }
-    if (
-      norm.startsWith('INSERT INTO organizations') ||
-      norm.startsWith('INSERT INTO tenants')
-    ) {
+    if (norm.startsWith('INSERT INTO organizations')) {
+      return { rows: [], rowCount: 1 }
+    }
+    if (norm.startsWith('INSERT INTO tenants')) {
+      tenants.set(String(values[0]), String(values[1]))
+      return { rows: [], rowCount: 1 }
+    }
+    if (/^SELECT org_id FROM tenants WHERE id = \$1$/i.test(norm)) {
+      const orgId = tenants.get(String(values[0]))
+      return {
+        rows: (orgId ? [{ org_id: orgId }] : []) as R[],
+        rowCount: orgId ? 1 : 0,
+      }
+    }
+    if (/^SELECT COUNT\(\*\) AS count FROM tenants/i.test(norm)) {
+      return { rows: [{ count: '1' }] as R[], rowCount: 1 }
+    }
+    if (/^SELECT COUNT\(\*\) AS count FROM memberships/i.test(norm)) {
+      const tenantId = String(values[0])
+      const count = membershipRows.filter(
+        (row) => row.tenant_id === tenantId && row.is_active,
+      ).length
+      return { rows: [{ count: String(count) }] as R[], rowCount: 1 }
+    }
+    if (/^SELECT .+ FROM subscriptions\b/i.test(norm)) {
+      const row = subscriptions.get(String(values[0]))
+      if (!row) return { rows: [], rowCount: 0 }
+      const columns = norm
+        .slice(norm.indexOf('SELECT ') + 7, norm.indexOf(' FROM subscriptions'))
+        .split(',')
+        .map((column) => column.trim())
+      const projected: Record<string, unknown> = {}
+      for (const column of columns) projected[column] = row[column]
+      return { rows: [projected] as R[], rowCount: 1 }
+    }
+    if (/^INSERT INTO subscriptions\b/i.test(norm)) {
+      const orgId = String(values[0])
+      if (subscriptions.has(orgId)) return { rows: [], rowCount: 0 }
+      const trialEndsAt = new Date(
+        Date.now() + 14 * 24 * 60 * 60 * 1000,
+      ).toISOString()
+      subscriptions.set(orgId, {
+        org_id: orgId,
+        plan_code: String(values[1]),
+        pending_plan_code: null,
+        status: 'trialing',
+        trial_ends_at: trialEndsAt,
+        current_period_start: null,
+        current_period_end: null,
+        cancel_at_period_end: false,
+        updated_by: null,
+        created_at: values[3] ?? trialEndsAt,
+        updated_at: values[3] ?? trialEndsAt,
+      })
+      return { rows: [], rowCount: 1 }
+    }
+    if (/^UPDATE subscriptions\b/i.test(norm)) {
+      const row = subscriptions.get(String(values[0]))
+      if (!row) return { rows: [], rowCount: 0 }
+      const setClause = norm.slice(
+        norm.indexOf(' SET ') + 5,
+        norm.indexOf(' WHERE '),
+      )
+      for (const assignment of setClause.split(',')) {
+        const parsed = assignment
+          .trim()
+          .match(/^([a-z_]+)\s*=\s*(\$\d+|'[^']*'|NULL|true|false)$/i)
+        if (!parsed) continue
+        const raw = parsed[2]
+        if (/^\$\d+$/.test(raw)) {
+          row[parsed[1]] = values[Number(raw.slice(1)) - 1]
+        } else if (/^null$/i.test(raw)) {
+          row[parsed[1]] = null
+        } else if (/^'.*'$/.test(raw)) {
+          row[parsed[1]] = raw.slice(1, -1)
+        } else {
+          row[parsed[1]] = raw.toLowerCase() === 'true'
+        }
+      }
       return { rows: [], rowCount: 1 }
     }
     if (/^SELECT payload_json(?:, tenant_id)? FROM salon_users/i.test(norm)) {
@@ -91,6 +170,10 @@ function createAuthMemoryPool(): SqlPoolLike {
       return { rows: [], rowCount: 1 }
     }
     if (norm.startsWith('INSERT INTO memberships')) {
+      membershipRows.push({
+        tenant_id: String(values[0]),
+        is_active: values[3] !== false,
+      })
       return { rows: [], rowCount: 1 }
     }
     if (norm.includes('FROM memberships')) {

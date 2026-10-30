@@ -228,6 +228,52 @@ SELECT tenant_id,
 ON CONFLICT (tenant_id, user_id) DO NOTHING;
 `
 
+
+/**
+ * Abonnements par organisation (phase « Monétisable »).
+ *
+ * L'organisation est l'unité de facturation : un abonnement couvre tous ses
+ * salons. Ces tables ne portent pas de RLS (elles sont lues par organisation,
+ * via `org_id` déduit du salon authentifié) : toutes les requêtes filtrent
+ * explicitement `org_id`.
+ */
+export const SUBSCRIPTIONS_SQL = `
+CREATE TABLE IF NOT EXISTS subscriptions (
+  org_id uuid PRIMARY KEY,
+  plan_code text NOT NULL DEFAULT 'decouverte',
+  pending_plan_code text,
+  status text NOT NULL DEFAULT 'trialing',
+  trial_ends_at timestamptz,
+  current_period_start timestamptz,
+  current_period_end timestamptz,
+  cancel_at_period_end boolean NOT NULL DEFAULT false,
+  updated_by text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS subscription_events (
+  id uuid PRIMARY KEY,
+  org_id uuid NOT NULL,
+  event text NOT NULL,
+  from_plan text,
+  to_plan text,
+  actor_id text,
+  payload_json jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_subscription_events_org
+  ON subscription_events (org_id, created_at);
+
+-- Backfill : chaque organisation existante reçoit un abonnement en essai
+-- (offre Professional offerte 14 jours, puis retour à Découverte).
+INSERT INTO subscriptions (org_id, plan_code, status, trial_ends_at)
+SELECT id, 'professional', 'trialing', now() + interval '14 days'
+  FROM organizations
+ON CONFLICT (org_id) DO NOTHING;
+`
+
 export const MIGRATIONS: Migration[] = [
   {
     id: '001_baseline',
@@ -253,6 +299,11 @@ export const MIGRATIONS: Migration[] = [
     id: '005_memberships',
     label: 'Appartenances multi-salons (rôle et activation par salon)',
     sql: MEMBERSHIPS_SQL,
+  },
+  {
+    id: '006_subscriptions',
+    label: 'Abonnements par organisation et journal de facturation',
+    sql: SUBSCRIPTIONS_SQL,
   },
 ]
 

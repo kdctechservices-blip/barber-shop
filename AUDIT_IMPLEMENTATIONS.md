@@ -22,12 +22,12 @@ Légende : `0 %` = inexistant · `25 %` = socle partiel · `50 %` = à parité f
 
 | Phase (`IMPLEMENTATIONS.md` §6) | Périmètre | Maturité | Constat |
 |---|---|---|---|
-| **Phase 1 — Fondations SaaS** | Multi-tenant, auth, RBAC, abonnements, sauvegarde, audit/sécurité | **30 %** | Auth solide (PBKDF2 + HMAC, local + cloud), 2 rôles seulement, sauvegarde JSON manuelle, journal de corrections financières. **Absents** : tenant, RLS, abonnements, audit sécurité, sauvegarde automatique, révocation de session. |
+| **Phase 1 — Fondations SaaS** | Multi-tenant, auth, RBAC, abonnements, sauvegarde, audit/sécurité | **45 %** | Livrés (sprints 1-7) : tenant + RLS forcée, sessions révocables, RBAC par salon, synchronisation delta serveur-autoritaire, abonnements + essai + limites d'offre. **Restent** : audit sécurité en base (`audit_events`), sauvegarde automatique planifiée, console éditeur, moyen de paiement réel. |
 | **Phase 2 — Expérience client** | Agenda, réservation en ligne, CRM, fidélité, notifications | **5 %** | Aucun modèle de rendez-vous, aucun client (juste un `clientName` texte libre), aucune fidélité, aucun canal WhatsApp/SMS. |
 | **Phase 3 — Gestion professionnelle** | Stock avancé/fournisseurs, planning, rapports financiers, multi-agences, paiements | **50 %** | Cœur financier très solide (caisse, CUMP, paie, commissions, 8 états financiers). Manquent fournisseurs/BC, planning/présences, multi-agences, intégrations de paiement. |
 | **Phase 4 — Innovation** | SALON AI, prévisions, automatisations, mini-sites, portefeuille client | **8 %** | Seuls le *run-rate* budgétaire et les alertes proactives existent. Aucun mini-site public, aucun portail client, aucun assistant. |
-| **Phase 5 — Éditeur SaaS** | Console super-admin, abonnements, facturation SaaS, support, statistiques | **0 %** | Aucun socle (pas de table `tenants`, pas de rôle plateforme, aucune route d'administration). |
-| **Global pondéré** | — | **≈ 22 %** | Le produit actuel est un *mono-tenant on-premise-like*, pas encore une plateforme. |
+| **Phase 5 — Éditeur SaaS** | Console super-admin, abonnements, facturation SaaS, support, statistiques | **15 %** | Socle de facturation livré (sprint 7) : catalogue d'offres, abonnements par organisation, activations et journal `subscription_events`. Manquent : console super-admin, rôle plateforme, statistiques d'usage, gestion de support. |
+| **Global pondéré** | — | **≈ 30 %** | Le socle multi-tenant et monétisable est en place ; l'expérience client (Phase 2) et l'innovation (Phase 4) restent à construire. |
 
 ### 0.3 Les six constats majeurs
 
@@ -238,10 +238,10 @@ Trois définitions de schéma maintenues **à la main** et actuellement **identi
 
 | Attendu | État |
 |---|---|
-| Essai gratuit, Starter/Pro/Business, facturation récurrente | ❌ (aucune table, aucun code, aucun écran) |
-| Limitations selon le forfait | ❌ |
+| Essai gratuit, Starter/Pro/Business, facturation récurrente | 🟡 Socle livré (sprint 7) : catalogue, essai 14 j, états d'abonnement, activation plateforme. **Reste** : encaissement réel (PSP), relances, factures PDF |
+| Limitations selon le forfait | 🟡 Effectif plafonné à l'inscription et au provisionnement (402 `PLAN_LIMIT_REACHED`) ; limite de salons et d'appareils calculée mais pas encore opposée (pas d'endpoint de création de salon) |
 | *Feature flags* | ❌ |
-| Portail de facturation / webhooks | ❌ |
+| Portail de facturation / webhooks | ❌ (activation par le canal plateforme uniquement, aucun webhook PSP) |
 
 **Effort** : 10–15 j-h pour un socle (plans, entitlements, quotas, essai, états d'abonnement, écran de facturation ; l'intégration d'un PSP local — Wave Business, CinetPay, PayDunya — est à ajouter).
 
@@ -654,9 +654,9 @@ Estimations : **j-h**, 1 développeur senior + assistance IA. `P0` = bloquant s�
 
 ---
 
-## 11. Suivi des correctifs — Sprints 1 à 6 (implémentés)
+## 11. Suivi des correctifs — Sprints 1 à 7 (implémentés)
 
-> Mise à jour du 30 octobre 2026, branche `arena/139c7e36-barber-shop`. Sprint 1 : périmètre P0-1 / P0-5 / P0-8 du backlog. Sprint 2 : P0-2 (isolation multi-tenant + RLS) et P0-4 (migrations versionnées). Sprint 3 : S4 (sessions révocables). Sprint 4 : P0-6 (synchronisation delta serveur-autoritaire). Sprint 5 : P0-7 (service worker hors-ligne). Sprint 6 : P1 (appartenances multi-salons et garde de rôle par entité).
+> Mise à jour du 30 octobre 2026, branche `arena/139c7e36-barber-shop`. Sprint 1 : périmètre P0-1 / P0-5 / P0-8 du backlog. Sprint 2 : P0-2 (isolation multi-tenant + RLS) et P0-4 (migrations versionnées). Sprint 3 : S4 (sessions révocables). Sprint 4 : P0-6 (synchronisation delta serveur-autoritaire). Sprint 5 : P0-7 (service worker hors-ligne). Sprint 6 : P1 (appartenances multi-salons et garde de rôle par entité). Sprint 7 : P1 (abonnements par organisation, essai, activation plateforme et limites d'offre).
 
 ### 11.1 Vulnérabilités traitées
 
@@ -914,11 +914,61 @@ Un compte ne pouvait appartenir qu'à un seul salon, et le rôle porté par le j
 - Pas encore d'interface de bascule de salon dans l'application (les routes existent et sont testées) ; l'écran de sélection fait partie du sprint suivant.
 - Politique de droits volontairement simple (rôle → tables) : pas de contrôle par champ ni par propriétaire de l'enregistrement.
 
-### 11.12 Reste à faire
 
-1. **P1** — écran « Équipe » basé sur `memberships` + sélecteur de salon, abonnements et limites de plan.
-2. **P1** — maintenance : purge des sessions expirées et du journal `sync_changes`, écran « appareils connectés », invite de mise à jour PWA.
-3. **P2** — dirty tracking côté client, politiques de droits par champ, notifications WhatsApp/SMS, CRM/fidélité.
+### 11.13 Sprint 7 — abonnements, essai et limites d'offre (implémenté)
+
+#### Pourquoi
+
+Le produit ne pouvait pas être **vendu au mois** : aucune notion d'offre, d'essai ou d'échéance, et rien n'empêchait un salon gratuit d'ajouter un effectif illimité. `IMPLEMENTATIONS.md` (§1.D, §5) en fait la contrepartie commerciale du multi-tenant.
+
+#### Ce qui est livré
+
+| Élément | Détail |
+|---|---|
+| Catalogue `server/plans.ts` | **Découverte** 0 FCFA (1 salon / 3 membres / 1 appareil) · **Starter** 4 900 (1 / 8 / 3) · **Professional** 9 900 (2 / 25 / 10) · **Business** 19 900 (5 / illimité) · **Enterprise** sur devis. `null` = illimité (jamais zéro) |
+| Abonnements `server/subscriptions.ts` | Abonnement porté par l'**organisation** (`org_id` en clé primaire), cycle `trialing` → `active` → `past_due` → Découverte, essai de 14 jours, grâce de 7 jours, période facturée de 30 jours |
+| Migration `006_subscriptions` | Tables `subscriptions` et `subscription_events` (journal : `plan_requested`, `plan_activated`, `plan_changed`, `plan_cancelled`), hors RLS (lues par organisation), backfill des organisations existantes avec un essai de 14 jours |
+| Calcul à la lecture | `effectivePlan()` déduit l'offre applicable de la date : aucun ordonnanceur ni tâche planifiée n'est nécessaire. Une échéance dépassée fait retomber l'organisation sur Découverte **automatiquement** |
+| Essai | 14 jours de l'offre **Professional** à la création du salon (`TRIAL_PLAN_CODE`), puis retour à Découverte |
+| Aucun paiement simulé | Une offre payante passe en `pending_payment` : les **limites du gratuit** s'appliquent et seule l'activation plateforme (`x-salon-pin`, secret serveur) fait passer l'abonnement en `active`. Une session Gérant ne peut pas s'auto-activer (403 `PLATFORM_SECRET_REQUIRED`) |
+| Révocation | Résiliation (`cancel_at_period_end`) : l'offre payée reste effective jusqu'à l'échéance, puis Découverte |
+| Limites opposées | `assertEmployeeCapacity()` à l'inscription (`/api/auth/register`) → **402 `PLAN_LIMIT_REACHED`** ; au provisionnement hors-ligne (`/api/users/provision`), les comptes au-delà du quota sont refusés et comptés dans `blockedByPlan` (aucune écriture partielle silencieuse) |
+| API | `GET /api/billing/plans` (public) · `GET /api/billing/subscription` (session) · `POST /api/billing/subscribe` et `/cancel` (Gérant, rate-limité) · `POST /api/billing/activate` (canal plateforme) |
+| Traçabilité | `subscription_events` (demande, activation, résiliation, acteur, durée, référence) + lignes `[audit] billing.*` côté serveur |
+| Client | `src/lib/billingClient.ts` : URL **relatives** (`/api/billing/*`), jeton de session automatique, erreurs typées (`BillingApiError`, code 402 propagé) |
+
+#### Décisions et hypothèses
+
+- **Prix Starter 4 900 FCFA = hypothèse commerciale**. `IMPLEMENTATIONS.md` ne fixe que Professional (9 900) et Business (19 900) ; le prix Starter doit être confirmé avant publication. Il est isolé dans une seule constante (`PLAN_CATALOG.starter.priceFcfa`).
+- **Essai = Professional** : choix produit (essai « tout compris ») plutôt que l'offre Découverte, pour que l'essai ait une valeur perçue.
+- **Salon hérité sans organisation** : aucune limite n'est appliquée (déploiements antérieurs au modèle `organizations`).
+- **Limite de salons** : `countOrgSalons()` et les limites sont exposées par l'API et calculées, mais aucune route ne crée encore de salon — la contrainte sera opposée avec l'écran multi-salon (sprint suivant).
+- **Aucun moyen de paiement simulé** : conforme à `IMPLEMENTATIONS.md` (aucun faux PSP, aucun webhook factice). L'encaissement réel (Wave Business, CinetPay, PayDunya) reste à intégrer.
+
+#### Validation
+
+| Commande | Résultat |
+|---|---|
+| `npm run lint` | 0 erreur, 0 avertissement (127 fichiers) |
+| `npm test` | **116/116** tests verts (20 fichiers) |
+| `npx tsc -b` | OK |
+| `npm run build` | OK — `sw.js` généré (36 fichiers, 1 542 Ko) |
+
+`src/test/subscriptions.test.ts` (11 tests) couvre : catalogue et prix, essai (puis chute en Découverte), grâce de 7 jours, offre payante en attente de paiement, résiliation conservant la période payée, catalogue public sans session, essai ouvert à l'inscription, souscription → activation plateforme (60 jours pour 2 mois), refus d'auto-activation par une session client, refus d'un Caissier (403), limite d'effectif (402) et plafonnement du provisionnement (`blockedByPlan`). `src/test/billingClient.test.ts` (4 tests) couvre le client navigateur : URL relatives, POST de souscription, propagation du 402 en erreur typée, résiliation sans corps.
+
+#### Limites assumées
+
+- Le quota d'**appareils** n'est pas encore compté : il suppose un registre d'appareils (écran « appareils connectés », P1) qui n'existe pas.
+- Pas d'écran de facturation dans l'application : les routes et le client sont livrés et testés, l'interface arrive avec l'écran « Équipe » (sprint suivant).
+- `subscription_events` n'est pas encore purgé (même chantier de maintenance que `sync_changes` et `sessions`).
+- Aucune relance automatique avant échéance : `daysRemaining` est exposé par l'API, l'UI devra alerter.
+
+### 11.14 Reste à faire
+
+1. **P1** — écran « Équipe » basé sur `memberships`, sélecteur de salon et écran d'abonnement (consommation + limites + demande d'offre).
+2. **P1** — maintenance : purge des sessions expirées, du journal `sync_changes` et de `subscription_events`, écran « appareils connectés » (quota d'appareils), invite de mise à jour PWA.
+3. **P1** — intégration d'un moyen de paiement réel (Wave Business / CinetPay / PayDunya) appelant le canal d'activation, avec factures et relances.
+4. **P2** — dirty tracking côté client, politiques de droits par champ, notifications WhatsApp/SMS, CRM/fidélité.
 
 
 

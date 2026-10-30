@@ -25,6 +25,12 @@ import {
   withTenantClient,
 } from './tenantContext.ts'
 import {
+  assertEmployeeCapacity,
+  getOrgIdForTenant,
+  getOrCreateSubscription,
+  readTenantPlan,
+} from './subscriptions.ts'
+import {
   isActiveManagerOfTenant,
   listMembershipsForUser,
   readMembership,
@@ -294,10 +300,28 @@ async function readAccountsForTenant(
 }
 
 /** Crée l'organisation et le salon d'un nouveau client SaaS. */
+/**
+ * Applique la limite d'effectif de l'offre en cours de l'organisation.
+ * Utilisée à l'inscription et à l'import massif de comptes : au-delà de la
+ * limite, l'API répond 402 `PLAN_LIMIT_REACHED`.
+ */
+async function assertTenantEmployeeCapacity(
+  pool: SqlPoolLike,
+  tenantId: string,
+  incoming: number,
+): Promise<void> {
+  const orgId = await getOrgIdForTenant(pool, tenantId)
+  // Salon hérité sans organisation (déploiement antérieur au multi-salon) :
+  // aucune offre à appliquer, donc aucune limite.
+  if (!orgId) return
+  const plan = await readTenantPlan(pool, tenantId)
+  assertEmployeeCapacity(plan.effective.plan, plan, incoming)
+}
+
 async function createTenantForSalon(
   pool: SqlPoolLike,
   salonName: string | undefined,
-): Promise<string> {
+): Promise<{ tenantId: string; organizationId: string }> {
   const tenantId = randomUUID()
   const organizationId = randomUUID()
   const name = (salonName ?? '').trim() || 'Mon salon'
@@ -310,7 +334,9 @@ async function createTenantForSalon(
      VALUES ($1, $2, $3, $4, 'active')`,
     [tenantId, organizationId, `salon-${tenantId.slice(0, 8)}`, name],
   )
-  return tenantId
+  // Essai gratuit de l'organisation nouvellement créée (offre Découverte).
+  await getOrCreateSubscription(pool, organizationId)
+  return { tenantId, organizationId }
 }
 
 export async function getNeonAuthStatus(
@@ -382,7 +408,7 @@ export async function registerUserOnNeon(
     tenantId = callerTenantId
   } else if (globalAccounts.length === 0) {
     // Tout premier compte du déploiement : création de l'organisation + du salon.
-    tenantId = await createTenantForSalon(pool, input.salonName)
+    tenantId = (await createTenantForSalon(pool, input.salonName)).tenantId
   } else {
     // Déploiement déjà initialisé : seule une autorisation Gérant ou le code
     // serveur permet d'ouvrir un compte supplémentaire.
@@ -435,6 +461,9 @@ export async function registerUserOnNeon(
       )
     }
   }
+
+  // Limite d'effectif de l'offre en cours (abonnement de l'organisation).
+  await assertTenantEmployeeCapacity(pool, tenantId, 1)
 
   const nowIso = new Date().toISOString()
   const account: SalonUserAccount = {
@@ -981,6 +1010,8 @@ export interface UserProvisioningResult {
   created: number
   skipped: number
   invalid: number
+  /** Comptes valides refusés car la limite d'effectif de l'offre est atteinte. */
+  blockedByPlan: number
 }
 
 /**
@@ -1001,6 +1032,17 @@ export async function provisionUsersOnNeon(
   let created = 0
   let skipped = 0
   let invalid = 0
+  let blockedByPlan = 0
+
+  // Limite d'effectif de l'offre en cours : les comptes au-delà sont refusés
+  // (jamais silencieusement écrasés) et comptés dans `blockedByPlan`.
+  const orgId = await getOrgIdForTenant(pool, tenantId)
+  const planContext = orgId ? await readTenantPlan(pool, tenantId) : null
+  const employeeLimit = planContext?.effective.plan.maxEmployees ?? null
+  let remainingCapacity =
+    employeeLimit === null
+      ? Number.POSITIVE_INFINITY
+      : Math.max(employeeLimit - (planContext?.members ?? 0), 0)
 
   const existing = await withTenantClient(pool, tenantId, (client) =>
     readAccountsForTenant(client, tenantId),
@@ -1044,6 +1086,11 @@ export async function provisionUsersOnNeon(
     if (existingIds.has(id) || existingEmails.has(email)) {
       // Compte déjà connu : on n'écrase ni le rôle ni le hash de mot de passe.
       skipped += 1
+      continue
+    }
+
+    if (remainingCapacity <= 0) {
+      blockedByPlan += 1
       continue
     }
 
@@ -1096,6 +1143,7 @@ export async function provisionUsersOnNeon(
         })
       })
       created += 1
+      remainingCapacity -= 1
       existingIds.add(account.id)
       existingEmails.add(account.email)
     } catch {
@@ -1104,7 +1152,7 @@ export async function provisionUsersOnNeon(
     }
   }
 
-  return { created, skipped, invalid }
+  return { created, skipped, invalid, blockedByPlan }
 }
 
 export async function listUsersOnNeon(

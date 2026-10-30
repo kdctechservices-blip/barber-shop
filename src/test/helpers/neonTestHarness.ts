@@ -65,6 +65,8 @@ const GLOBAL_TABLES = [
   'sync_state',
   'sync_changes',
   'memberships',
+  'subscriptions',
+  'subscription_events',
 ]
 
 const ALL_TABLE_NAMES = [...TENANT_SCOPED_TABLES, ...GLOBAL_TABLES]
@@ -135,6 +137,41 @@ export function createInMemoryNeonPool(options?: { failNetwork?: boolean }): {
           return false
       }
     })
+  /** Découpe une liste SQL de valeurs (`$1`, `'lit'`, `NULL`, `$7::jsonb`). */
+  const parseValueTokens = (clause: string, values: unknown[]): unknown[] =>
+    clause
+      .split(',')
+      .map((token) => token.trim())
+      .map((token) => {
+        const param = token.match(/^\$(\d+)(?:::\w+)?$/)
+        if (param) return values[Number(param[1]) - 1]
+        const quoted = token.match(/^'([^']*)'$/)
+        if (quoted) return quoted[1]
+        if (/^null$/i.test(token)) return null
+        if (/^true$/i.test(token)) return true
+        if (/^false$/i.test(token)) return false
+        if (/^-?\d+(\.\d+)?$/.test(token)) return Number(token)
+        throw new Error(`Valeur SQL non gérée : ${token}`)
+      })
+
+  /** Découpe une clause `SET` (`col = $2`, `col = 'lit'`, `col = NULL`). */
+  const parseAssignments = (
+    clause: string,
+    values: unknown[],
+  ): { column: string; value: unknown }[] =>
+    clause.split(',').map((assignment) => {
+      const parsed = assignment
+        .trim()
+        .match(/^([a-z_]+)\s*=\s*(\$\d+(?:::\w+)?|'[^']*'|NULL|true|false|-?\d+(\.\d+)?)$/i)
+      if (!parsed) {
+        throw new Error(`Assignation SQL non gérée : ${assignment}`)
+      }
+      return {
+        column: parsed[1],
+        value: parseValueTokens(parsed[2], values)[0],
+      }
+    })
+
   const rowKey = (table: string, id: string): string => {
     if (!TENANT_SCOPED_TABLES.has(table)) return id
     if (!currentTenant) return `∅::${id}`
@@ -241,6 +278,129 @@ export function createInMemoryNeonPool(options?: { failNetwork?: boolean }): {
           updated[assignment.column] = assignment.value
         }
         tables.get('sessions')!.set(key, updated as unknown as StoredRow)
+        rowCount += 1
+      }
+      return { rows: [], rowCount }
+    }
+
+
+    // Comptages servant aux limites d'offre (abonnements)
+    if (
+      /^SELECT COUNT\(\*\) AS count FROM memberships WHERE tenant_id = \$1(?: AND is_active = true)?$/i.test(
+        normalized,
+      )
+    ) {
+      const tenantId = String(values[0])
+      const onlyActive = /is_active = true/i.test(normalized)
+      const rows = Array.from(tables.get('memberships')!.values()).filter(
+        (row) =>
+          String((row as unknown as Record<string, unknown>).tenant_id) ===
+            tenantId &&
+          (!onlyActive ||
+            (row as unknown as Record<string, unknown>).is_active !== false),
+      )
+      return {
+        rows: [{ count: String(rows.length) }] as R[],
+        rowCount: 1,
+      }
+    }
+
+    if (
+      /^SELECT COUNT\(\*\) AS count FROM tenants WHERE org_id = \$1$/i.test(
+        normalized,
+      )
+    ) {
+      const orgId = String(values[0])
+      const rows = Array.from(tables.get('tenants')!.values()).filter(
+        (row) =>
+          String((row as unknown as Record<string, unknown>).org_id) === orgId,
+      )
+      return { rows: [{ count: String(rows.length) }] as R[], rowCount: 1 }
+    }
+
+    // Organisation d'un salon (facturation par organisation)
+    if (/^SELECT org_id FROM tenants WHERE id = \$1$/i.test(normalized)) {
+      const row = tables.get('tenants')!.get(String(values[0]))
+      const orgId = row
+        ? (row as unknown as Record<string, unknown>).org_id
+        : undefined
+      return {
+        rows: (orgId ? [{ org_id: orgId }] : []) as R[],
+        rowCount: orgId ? 1 : 0,
+      }
+    }
+
+    if (
+      /^SELECT id FROM tenants WHERE org_id = \$1 ORDER BY created_at LIMIT 1$/i.test(
+        normalized,
+      )
+    ) {
+      const orgId = String(values[0])
+      const rows = Array.from(tables.get('tenants')!.values())
+        .filter(
+          (row) =>
+            String((row as unknown as Record<string, unknown>).org_id) === orgId,
+        )
+        .sort((a, b) => String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')))
+      return {
+        rows: (rows[0] ? [{ id: rows[0].id }] : []) as R[],
+        rowCount: rows[0] ? 1 : 0,
+      }
+    }
+
+    // Abonnements (Sprint 7) — clé primaire = organisation
+    if (/^SELECT .+ FROM subscriptions\b/i.test(normalized)) {
+      const match = normalized.match(
+        /^SELECT (.+?) FROM subscriptions(?: WHERE (.+?))?$/i,
+      )
+      if (!match) throw new Error(`Requête subscriptions non gérée : ${normalized}`)
+      const columns = match[1].split(',').map((column) => column.trim())
+      const conditions = match[2] ? parseConditions(match[2], values) : []
+      const rows = Array.from(tables.get('subscriptions')!.values())
+        .filter((row) => matchesConditions(row, conditions))
+        .map((row) => {
+          const projected: Record<string, unknown> = {}
+          for (const column of columns) {
+            projected[column] = (row as unknown as Record<string, unknown>)[column]
+          }
+          return projected as R
+        })
+      return { rows, rowCount: rows.length }
+    }
+
+    if (/^INSERT INTO subscriptions\b/i.test(normalized)) {
+      const match = normalized.match(
+        /^INSERT INTO subscriptions\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)/i,
+      )
+      if (!match) throw new Error(`INSERT subscriptions non géré : ${normalized}`)
+      const cols = match[1].split(',').map((column) => column.trim())
+      const vals = parseValueTokens(match[2], values)
+      const row: Record<string, unknown> = {}
+      cols.forEach((column, index) => {
+        row[column] = vals[index]
+      })
+      const key = String(row.org_id ?? '')
+      const overwrite = /DO UPDATE/i.test(normalized)
+      if (tables.get('subscriptions')!.has(key) && !overwrite) {
+        return { rows: [], rowCount: 0 }
+      }
+      tables.get('subscriptions')!.set(key, row as unknown as StoredRow)
+      return { rows: [], rowCount: 1 }
+    }
+
+    if (/^UPDATE subscriptions\b/i.test(normalized)) {
+      const match = normalized.match(/^UPDATE subscriptions SET (.+?) WHERE (.+)$/i)
+      if (!match) throw new Error(`UPDATE subscriptions non géré : ${normalized}`)
+      const assignments = parseAssignments(match[1], values)
+      const conditions = parseConditions(match[2], values)
+      let rowCount = 0
+      for (const [key, row] of tables.get('subscriptions')!) {
+        if (!matchesConditions(row, conditions)) continue
+        const updated = { ...row } as unknown as Record<string, unknown>
+        for (const assignment of assignments) {
+          updated[assignment.column] = assignment.value
+        }
+        tables.get('subscriptions')!.set(key, updated as unknown as StoredRow)
         rowCount += 1
       }
       return { rows: [], rowCount }
@@ -542,6 +702,43 @@ export async function seedMembership(
       params.role ?? 'manager',
       params.isActive !== false,
       now,
+    ],
+  )
+}
+
+/**
+ * Fixe l'abonnement d'une organisation — préparation des tests de limites.
+ * Par défaut : offre Professional active sur une période d'un mois.
+ */
+export async function seedSubscription(
+  pool: SqlPoolLike,
+  params: {
+    orgId: string
+    planCode?: string
+    status?: string
+    trialEndsAt?: string | null
+    currentPeriodStart?: string | null
+    currentPeriodEnd?: string | null
+    pendingPlanCode?: string | null
+    cancelAtPeriodEnd?: boolean
+  },
+): Promise<void> {
+  const now = new Date()
+  const inOneMonth = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000)
+  await pool.query(
+    `INSERT INTO subscriptions (org_id, plan_code, pending_plan_code, status, trial_ends_at, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+     ON CONFLICT (org_id) DO UPDATE SET plan_code = EXCLUDED.plan_code`,
+    [
+      params.orgId,
+      params.planCode ?? 'professional',
+      params.pendingPlanCode ?? null,
+      params.status ?? 'active',
+      params.trialEndsAt ?? null,
+      params.currentPeriodStart ?? now.toISOString(),
+      params.currentPeriodEnd ?? inOneMonth.toISOString(),
+      params.cancelAtPeriodEnd === true,
+      now.toISOString(),
     ],
   )
 }

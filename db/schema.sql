@@ -10,6 +10,8 @@
 -- La migration 003_sessions y ajoute la table sessions (jetons révocables).
 -- La migration 004_sync_revisions y ajoute sync_state et sync_changes (delta).
 -- La migration 005_memberships y ajoute memberships (rôle et activation par salon).
+-- La migration 006_subscriptions y ajoute subscriptions et subscription_events
+-- (abonnement porté par l'organisation : offre, essai, échéances, journal).
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS salon_info (
