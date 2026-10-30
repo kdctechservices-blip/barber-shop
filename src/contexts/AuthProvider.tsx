@@ -443,15 +443,34 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setSessionToken(switched.sessionToken)
       persistAuthSession(nextUser, switched.sessionToken, rememberMe, switched.refreshToken)
       setActiveTenantId(switched.tenantId)
-      // Les données locales (IndexedDB) sont propres à un salon : on recharge
-      // pour repartir d'un état vierge côté affichage.
+      // Les données locales (IndexedDB) sont propres à un salon : on les purge
+      // avant le rechargement pour éviter d'afficher les données du salon
+      // précédent en attendant la resynchronisation cloud du nouveau salon.
+      try {
+        await mutate(async (repo) => repo.purgeLocalDatabase())
+      } catch {
+        // Ignoré : la bascule reste effective, les données seront
+        // resynchronisées après rechargement.
+      }
+      // Vider le curseur de sync pour forcer un full pull au prochain chargement.
+      try {
+        window.localStorage.removeItem('salon_pro_cloud_sync_cursor')
+      } catch {
+        // ignore storage errors
+      }
+      // Flag pour déclencher un sync complet immédiatement après rechargement.
+      try {
+        window.localStorage.setItem('salon_pro_pending_full_sync', '1')
+      } catch {
+        // ignore storage errors
+      }
       try {
         window.location.assign('/dashboard')
       } catch {
         // Environnement sans navigation (tests) : la bascule reste effective.
       }
     },
-    [],
+    [mutate],
   )
 
   const logout = useCallback(() => {

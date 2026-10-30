@@ -338,6 +338,25 @@ export function CloudSyncProvider({ children }: { children: ReactNode }) {
   }, [mutationCount, prefs.enabled, prefs.autoSync, runBidirectionalSync])
 
   useEffect(() => {
+    // Après une bascule de salon (switchTenant), le curseur a été vidé et un
+    // flag a été posé dans localStorage : déclencher un full sync pour
+    // recharger les données du nouveau salon depuis Neon.
+    if (!prefs.enabled) return
+    try {
+      const pending =
+        typeof window !== 'undefined'
+          ? window.localStorage.getItem('salon_pro_pending_full_sync')
+          : null
+      if (pending === '1') {
+        window.localStorage.removeItem('salon_pro_pending_full_sync')
+        void runBidirectionalSync({ silent: true })
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }, [prefs.enabled, runBidirectionalSync])
+
+  useEffect(() => {
     if (!prefs.enabled) return
     const handleOnline = () => {
       void runBidirectionalSync({ silent: true })

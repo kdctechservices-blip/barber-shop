@@ -18,8 +18,16 @@ import type {
   CashSession,
   CategoryItem,
   CorrectionLog,
+  Client,
+  ClientLoyaltyTier,
+  ClientSource,
+  ClientStats,
   Employee,
+  Appointment,
+  AppointmentSource,
+  AppointmentStatus,
   ExpenseEntry,
+  Invoice,
   PaymentMethodCode,
   PersistedSyncTombstone,
   ProductItem,
@@ -73,9 +81,15 @@ export class DexieTableRepository<T extends { id: string }>
   implements IRepository<T>
 {
   private readonly table: Table<T, string>
+  private readonly onDirty: (() => void) | undefined
 
-  constructor(table: Table<T, string>) {
+  constructor(table: Table<T, string>, onDirty?: () => void) {
     this.table = table
+    this.onDirty = onDirty
+  }
+
+  private notifyDirty(): void {
+    this.onDirty?.()
   }
 
   async getAll(): Promise<T[]> {
@@ -88,11 +102,13 @@ export class DexieTableRepository<T extends { id: string }>
 
   async create(item: T): Promise<T> {
     await this.table.add(item)
+    this.notifyDirty()
     return item
   }
 
   async update(id: string, changes: Partial<T>): Promise<T> {
     await this.table.update(id, changes as never)
+    this.notifyDirty()
     const updated = await this.table.get(id)
     if (!updated) {
       throw new Error('Enregistrement introuvable après mise à jour.')
@@ -105,10 +121,12 @@ export class DexieTableRepository<T extends { id: string }>
       isArchived: true,
       updatedAt: new Date().toISOString(),
     } as never)
+    this.notifyDirty()
   }
 
   async delete(id: string): Promise<void> {
     await this.table.delete(id)
+    this.notifyDirty()
   }
 }
 
@@ -130,6 +148,9 @@ export interface FullSalonState {
   budgets: BudgetTarget[]
   recurringExpenses: RecurringExpenseTemplate[]
   correctionLogs: CorrectionLog[]
+  clients: Client[]
+  appointments: Appointment[]
+  invoices: Invoice[]
 }
 
 export interface CheckoutTicketLineInput {
@@ -190,20 +211,74 @@ export class SalonRepositoryHub {
   public readonly budgetsRepo: DexieTableRepository<BudgetTarget>
   public readonly recurringExpensesRepo: DexieTableRepository<RecurringExpenseTemplate>
   public readonly categoriesRepo: DexieTableRepository<CategoryItem>
+  public readonly invoicesRepo: DexieTableRepository<Invoice>
+  public readonly clientsRepo: DexieTableRepository<Client>
+  public readonly appointmentsRepo: DexieTableRepository<Appointment>
   private readonly dupGuard = new DuplicateSubmissionGuard()
+  /** Tables modifiées depuis la dernière synchronisation réussie (dirty tracking). */
+  private readonly dirtyTables = new Set<string>()
 
   constructor(database: SalonProDatabase = db) {
     this.database = database
-    this.servicesRepo = new DexieTableRepository(database.services)
-    this.employeesRepo = new DexieTableRepository(database.employees)
-    this.revenuesRepo = new DexieTableRepository(database.revenues)
-    this.expensesRepo = new DexieTableRepository(database.expenses)
-    this.productsRepo = new DexieTableRepository(database.products)
-    this.budgetsRepo = new DexieTableRepository(database.budgets)
+    this.servicesRepo = new DexieTableRepository(
+      database.services,
+      () => this.markDirty('services_catalog'),
+    )
+    this.employeesRepo = new DexieTableRepository(
+      database.employees,
+      () => this.markDirty('employees'),
+    )
+    this.revenuesRepo = new DexieTableRepository(
+      database.revenues,
+      () => this.markDirty('revenues'),
+    )
+    this.expensesRepo = new DexieTableRepository(
+      database.expenses,
+      () => this.markDirty('expenses'),
+    )
+    this.productsRepo = new DexieTableRepository(
+      database.products,
+      () => this.markDirty('products'),
+    )
+    this.budgetsRepo = new DexieTableRepository(
+      database.budgets,
+      () => this.markDirty('budgets'),
+    )
     this.recurringExpensesRepo = new DexieTableRepository(
       database.recurringExpenses,
+      () => this.markDirty('recurring_expenses'),
     )
-    this.categoriesRepo = new DexieTableRepository(database.categories)
+    this.categoriesRepo = new DexieTableRepository(
+      database.categories,
+      () => this.markDirty('categories'),
+    )
+    this.invoicesRepo = new DexieTableRepository(
+      database.invoices,
+      () => this.markDirty('invoices'),
+    )
+    this.clientsRepo = new DexieTableRepository(
+      database.clients,
+      () => this.markDirty('clients'),
+    )
+    this.appointmentsRepo = new DexieTableRepository(
+      database.appointments,
+      () => this.markDirty('appointments'),
+    )
+  }
+
+  /** Marque une table comme modifiée (appelé par les méthodes de mutation). */
+  private markDirty(tableName: string): void {
+    this.dirtyTables.add(tableName)
+  }
+
+  /** Retourne la liste des tables modifiées depuis le dernier clear. */
+  public getDirtyTables(): string[] {
+    return Array.from(this.dirtyTables)
+  }
+
+  /** Vide le jeu des tables sales (à appeler après une sync réussie). */
+  public clearDirtyTables(): void {
+    this.dirtyTables.clear()
   }
 
   public clearDuplicateGuard(): void {
@@ -356,6 +431,7 @@ export class SalonRepositoryHub {
           isLegacyMockRecord,
           'correction_log',
         )
+        await sweepTable(this.database.invoices, isLegacyMockRecord, 'invoice')
 
         if (newTombstones.length > 0) {
           await this.database.syncTombstones.bulkPut(newTombstones)
@@ -442,6 +518,9 @@ export class SalonRepositoryHub {
       budgets,
       recurringExpenses,
       correctionLogs,
+      invoices,
+      clients,
+      appointments,
     ] = await Promise.all([
       this.database.salon.get('salon-main'),
       this.database.settings.get('default'),
@@ -460,6 +539,9 @@ export class SalonRepositoryHub {
       this.database.budgets.toArray(),
       this.database.recurringExpenses.toArray(),
       this.database.correctionLogs.toArray(),
+      this.database.invoices.toArray(),
+      this.database.clients.toArray(),
+      this.database.appointments.toArray(),
     ])
 
     return {
@@ -480,6 +562,9 @@ export class SalonRepositoryHub {
       budgets,
       recurringExpenses,
       correctionLogs,
+      invoices,
+      clients,
+      appointments,
     }
   }
 
@@ -517,6 +602,7 @@ export class SalonRepositoryHub {
       'rw',
       [this.database.cashSessions],
       async () => {
+        this.markDirty('cash_sessions')
         const existingOpen = await this.database.cashSessions
           .where('status')
           .equals('open')
@@ -621,6 +707,8 @@ export class SalonRepositoryHub {
       'rw',
       [this.database.cashSessions, this.database.cashMovements],
       async () => {
+        this.markDirty('cash_sessions')
+        this.markDirty('cash_movements')
         const session = await this.database.cashSessions.get(params.sessionId)
         if (!session) throw new Error('Session de caisse introuvable.')
         if (session.status === 'closed') {
@@ -675,6 +763,9 @@ export class SalonRepositoryHub {
         this.database.correctionLogs,
       ],
       async () => {
+        this.markDirty('cash_sessions')
+        this.markDirty('cash_movements')
+        this.markDirty('correction_logs')
         const session = await this.database.cashSessions.get(params.sessionId)
         if (!session) throw new Error('Session de caisse introuvable.')
         if (session.status === 'closed') {
@@ -738,8 +829,10 @@ export class SalonRepositoryHub {
 
     return this.database.transaction(
       'rw',
-      [this.database.cashSessions, this.database.correctionLogs],
+      [this.database.cashSessions, this.database.cashMovements],
       async () => {
+        this.markDirty('cash_sessions')
+        this.markDirty('cash_movements')
         const session = await this.database.cashSessions.get(params.sessionId)
         if (!session || session.status !== 'closed') {
           throw new Error('Session clôturée introuvable.')
@@ -849,6 +942,12 @@ export class SalonRepositoryHub {
         this.database.cashMovements,
       ],
       async () => {
+        this.markDirty('services_catalog')
+        this.markDirty('revenues')
+        this.markDirty('products')
+        this.markDirty('stock_movements')
+        this.markDirty('cash_sessions')
+        this.markDirty('cash_movements')
         const nowIso = new Date().toISOString()
         const ticketId = makeId('tkt')
         const receiptNumber = await this.generateReceiptNumber(input.date)
@@ -1289,6 +1388,10 @@ export class SalonRepositoryHub {
         this.database.correctionLogs,
       ],
       async () => {
+        this.markDirty('revenues')
+        this.markDirty('cash_movements')
+        this.markDirty('cash_sessions')
+        this.markDirty('correction_logs')
         const existing = await this.database.revenues.get(params.id)
         if (!existing) throw new Error('Recette introuvable.')
 
@@ -1387,6 +1490,12 @@ export class SalonRepositoryHub {
         this.database.correctionLogs,
       ],
       async () => {
+        this.markDirty('revenues')
+        this.markDirty('products')
+        this.markDirty('stock_movements')
+        this.markDirty('cash_movements')
+        this.markDirty('cash_sessions')
+        this.markDirty('correction_logs')
         const rev = await this.database.revenues.get(id)
         if (!rev || rev.isArchived) return
         const nowIso = new Date().toISOString()
@@ -1595,6 +1704,10 @@ export class SalonRepositoryHub {
         this.database.correctionLogs,
       ],
       async () => {
+        this.markDirty('expenses')
+        this.markDirty('cash_movements')
+        this.markDirty('cash_sessions')
+        this.markDirty('correction_logs')
         const existing = await this.database.expenses.get(params.id)
         if (!existing) throw new Error('Dépense introuvable.')
         if (existing.sourceModule === 'payroll') {
@@ -1692,6 +1805,9 @@ export class SalonRepositoryHub {
         this.database.cashSessions,
       ],
       async () => {
+        this.markDirty('expenses')
+        this.markDirty('cash_movements')
+        this.markDirty('cash_sessions')
         const exp = await this.database.expenses.get(id)
         if (!exp) return
         if (exp.sourceModule === 'payroll') {
@@ -1845,6 +1961,7 @@ export class SalonRepositoryHub {
     callerRole?: UserRole,
   ): Promise<ServiceCatalogItem> {
     this.assertManagerForServiceConfig(callerRole)
+    this.markDirty('services_catalog')
     const current = await this.servicesRepo.getById(id)
     if (!current) throw new Error('Prestation introuvable.')
     return this.servicesRepo.update(id, {
@@ -1858,6 +1975,7 @@ export class SalonRepositoryHub {
     callerRole?: UserRole,
   ): Promise<void> {
     this.assertManagerForServiceConfig(callerRole)
+    this.markDirty('services_catalog')
     const usedCount = await this.database.revenues
       .where('serviceId')
       .equals(id)
@@ -1889,6 +2007,7 @@ export class SalonRepositoryHub {
     commissionRate: number
     adminNote?: string
   }): Promise<Employee> {
+    this.markDirty('employees')
     const check = validateEmployeeInput(input)
     if (!check.valid) throw new Error(check.error)
 
@@ -1937,10 +2056,222 @@ export class SalonRepositoryHub {
   }
 
   public async toggleEmployeeActive(id: string): Promise<Employee> {
+    this.markDirty('employees')
     const emp = await this.employeesRepo.getById(id)
     if (!emp) throw new Error('Employé introuvable.')
     return this.employeesRepo.update(id, {
       isActive: !emp.isActive,
+      updatedAt: new Date().toISOString(),
+    })
+  }
+
+  // --------------------------------------------------------------------------
+  // CLIENTS / CRM (Section 11.16 Sprint 3 — sous-tâche 3)
+  // --------------------------------------------------------------------------
+  public async saveClient(input: {
+    id?: string
+    firstName: string
+    lastName: string
+    phone?: string
+    email?: string
+    source?: ClientSource
+    note?: string
+  }): Promise<Client> {
+    this.markDirty('clients')
+    const nowIso = new Date().toISOString()
+    const firstName = input.firstName.trim()
+    const lastName = input.lastName.trim()
+    const fullName = `${firstName} ${lastName}`
+    const phone = input.phone?.trim() ?? ''
+    const email = input.email?.trim() ?? ''
+    const source = input.source ?? 'walkin'
+
+    const existing = input.id ? await this.clientsRepo.getById(input.id) : null
+    if (existing && input.id) {
+      return this.clientsRepo.update(input.id, {
+        firstName,
+        lastName,
+        fullName,
+        phone,
+        email,
+        source,
+        note: input.note?.trim() ?? existing.note,
+        updatedAt: nowIso,
+      })
+    }
+
+    const tier: ClientLoyaltyTier = 'bronze'
+    this.assertNotDuplicate(`cli:${phone || email || fullName}`)
+    return this.clientsRepo.create({
+      id: makeId('cli'),
+      firstName,
+      lastName,
+      fullName,
+      phone,
+      email,
+      source,
+      loyaltyPoints: 0,
+      loyaltyTier: tier,
+      totalVisits: 0,
+      totalSpent: 0,
+      note: input.note?.trim() ?? '',
+      isActive: true,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    })
+  }
+
+  public async toggleClientActive(id: string): Promise<Client> {
+    this.markDirty('clients')
+    const cli = await this.clientsRepo.getById(id)
+    if (!cli) throw new Error('Client introuvable.')
+    return this.clientsRepo.update(id, {
+      isActive: !cli.isActive,
+      updatedAt: new Date().toISOString(),
+    })
+  }
+
+  public async deleteClient(id: string): Promise<void> {
+    this.markDirty('clients')
+    await this.clientsRepo.delete(id)
+    await this.persistTombstone('client', id)
+  }
+
+  public async getClientStats(): Promise<ClientStats> {
+    const clients = await this.clientsRepo.getAll()
+    const activeClients = clients.filter((c) => c.isActive)
+    const now = new Date()
+    const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+    const newClientsThisMonth = clients.filter(
+      (c) => c.createdAt.startsWith(currentMonth),
+    ).length
+
+    const topClients = [...clients]
+      .sort((a, b) => b.totalSpent - a.totalSpent)
+      .slice(0, 5)
+      .map((c) => ({
+        id: c.id,
+        fullName: c.fullName,
+        totalSpent: c.totalSpent,
+        totalVisits: c.totalVisits,
+      }))
+
+    return {
+      totalClients: clients.length,
+      activeClients: activeClients.length,
+      newClientsThisMonth,
+      topClients,
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // RENDEZ-VOUS / AGENDA (Section 11.16 Sprint 3 — sous-tâche 5)
+  // --------------------------------------------------------------------------
+  public async saveAppointment(input: {
+    id?: string
+    clientId: string
+    clientName: string
+    serviceId: string
+    serviceName: string
+    employeeId?: string
+    employeeName?: string
+    startAt: string
+    endAt: string
+    status?: AppointmentStatus
+    source?: AppointmentSource
+    amount: number
+    paymentStatus?: 'pending' | 'paid' | 'partial' | 'refunded'
+    note?: string
+  }): Promise<Appointment> {
+    this.markDirty('appointments')
+    const nowIso = new Date().toISOString()
+    const status = input.status ?? 'pending'
+    const source = input.source ?? 'walkin'
+    const paymentStatus = input.paymentStatus ?? 'pending'
+
+    if (input.id) {
+      return this.appointmentsRepo.update(input.id, {
+        clientId: input.clientId,
+        clientName: input.clientName.trim(),
+        serviceId: input.serviceId,
+        serviceName: input.serviceName.trim(),
+        employeeId: input.employeeId,
+        employeeName: input.employeeName?.trim(),
+        startAt: input.startAt,
+        endAt: input.endAt,
+        status,
+        source,
+        amount: toIntFCFA(input.amount),
+        paymentStatus,
+        note: input.note?.trim(),
+        updatedAt: nowIso,
+      })
+    }
+
+    this.assertNotDuplicate(
+      `appt:${input.clientId}:${input.serviceId}:${input.startAt}`,
+    )
+    return this.appointmentsRepo.create({
+      id: makeId('appt'),
+      clientId: input.clientId,
+      clientName: input.clientName.trim(),
+      serviceId: input.serviceId,
+      serviceName: input.serviceName.trim(),
+      employeeId: input.employeeId,
+      employeeName: input.employeeName?.trim(),
+      startAt: input.startAt,
+      endAt: input.endAt,
+      status,
+      source,
+      amount: toIntFCFA(input.amount),
+      paymentStatus,
+      note: input.note?.trim() ?? '',
+      reminderSent: false,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    })
+  }
+
+  public async updateAppointmentStatus(
+    id: string,
+    status: AppointmentStatus,
+  ): Promise<Appointment> {
+    this.markDirty('appointments')
+    const appt = await this.appointmentsRepo.getById(id)
+    if (!appt) throw new Error('Rendez-vous introuvable.')
+    return this.appointmentsRepo.update(id, {
+      status,
+      updatedAt: new Date().toISOString(),
+    })
+  }
+
+  public async deleteAppointment(id: string): Promise<void> {
+    this.markDirty('appointments')
+    await this.appointmentsRepo.delete(id)
+    await this.persistTombstone('appointment', id)
+  }
+
+  public async getAppointmentsByDateRange(
+    from: string,
+    to: string,
+  ): Promise<Appointment[]> {
+    return this.database.appointments
+      .where('startAt')
+      .aboveOrEqual(from)
+      .and((appt) => appt.startAt <= to)
+      .toArray()
+  }
+
+  public async getAppointmentsByClient(clientId: string): Promise<Appointment[]> {
+    return this.appointmentsRepo.getAll().then((a) =>
+      a.filter((appt) => appt.clientId === clientId),
+    )
+  }
+
+  public async markAppointmentReminderSent(id: string): Promise<void> {
+    this.markDirty('appointments')
+    await this.appointmentsRepo.update(id, {
+      reminderSent: true,
       updatedAt: new Date().toISOString(),
     })
   }
@@ -1954,6 +2285,7 @@ export class SalonRepositoryHub {
     amount: number
     reason: string
   }): Promise<BonusEntry> {
+    this.markDirty('bonuses')
     const v = validatePositiveFCFA(input.amount, 'Le montant de la prime')
     if (!v.valid) throw new Error(v.error)
     if (!input.reason || input.reason.trim().length < 2) {
@@ -1986,6 +2318,11 @@ export class SalonRepositoryHub {
     reference?: string
     note?: string
   }): Promise<AdvanceEntry> {
+    this.markDirty('employees')
+    this.markDirty('advances')
+    this.markDirty('expenses')
+    this.markDirty('cash_sessions')
+    this.markDirty('cash_movements')
     const v = validatePositiveFCFA(input.amount, "Le montant de l'avance")
     if (!v.valid) throw new Error(v.error)
     this.assertNotDuplicate(
@@ -2104,6 +2441,12 @@ export class SalonRepositoryHub {
         this.database.cashMovements,
       ],
       async () => {
+        this.markDirty('employees')
+        this.markDirty('advances')
+        this.markDirty('salary_payments')
+        this.markDirty('expenses')
+        this.markDirty('cash_sessions')
+        this.markDirty('cash_movements')
         const emp = await this.database.employees.get(input.employeeId)
         if (!emp) throw new Error('Employé introuvable.')
 
@@ -2329,6 +2672,7 @@ export class SalonRepositoryHub {
     alertThreshold: number
     usageType: ProductItem['usageType']
   }): Promise<ProductItem> {
+    this.markDirty('products')
     const check = validateProductInput(input)
     if (!check.valid) throw new Error(check.error)
 
@@ -2428,6 +2772,13 @@ export class SalonRepositoryHub {
         this.database.correctionLogs,
       ],
       async () => {
+        this.markDirty('products')
+        this.markDirty('stock_movements')
+        this.markDirty('expenses')
+        this.markDirty('revenues')
+        this.markDirty('cash_sessions')
+        this.markDirty('cash_movements')
+        this.markDirty('correction_logs')
         const prod = await this.database.products.get(input.productId)
         if (!prod) throw new Error('Produit introuvable.')
 
@@ -2657,6 +3008,7 @@ export class SalonRepositoryHub {
   public async toggleRecurringExpenseTemplate(
     id: string,
   ): Promise<RecurringExpenseTemplate> {
+    this.markDirty('recurring_expenses')
     const existing = await this.recurringExpensesRepo.getById(id)
     if (!existing) throw new Error('Modèle de charge récurrente introuvable.')
     return this.recurringExpensesRepo.update(id, {
@@ -2666,6 +3018,7 @@ export class SalonRepositoryHub {
   }
 
   public async deleteRecurringExpenseTemplate(id: string): Promise<void> {
+    this.markDirty('recurring_expenses')
     await this.recurringExpensesRepo.delete(id)
     await this.persistTombstone('recurring_expense', id)
   }
@@ -2720,6 +3073,7 @@ export class SalonRepositoryHub {
     plannedAmount: number
     note?: string
   }): Promise<BudgetTarget> {
+    this.markDirty('budgets')
     const v = validatePositiveFCFA(input.plannedAmount, 'Le montant budgétaire')
     if (!v.valid) throw new Error(v.error)
 
@@ -2754,6 +3108,7 @@ export class SalonRepositoryHub {
   }
 
   public async deleteBudgetTarget(id: string): Promise<void> {
+    this.markDirty('budgets')
     const existing = await this.budgetsRepo.getById(id)
     if (!existing) {
       throw new Error('Ligne budgétaire introuvable.')
@@ -2817,6 +3172,7 @@ export class SalonRepositoryHub {
   // PARAMÈTRES, CATÉGORIES & SAUVEGARDES LOCALES (Section 16)
   // --------------------------------------------------------------------------
   public async updateSalonInfo(changes: Partial<SalonInfo>): Promise<SalonInfo> {
+    this.markDirty('salon_info')
     const current =
       (await this.database.salon.get('salon-main')) ?? buildDefaultSalonInfo()
     const updated: SalonInfo = {
@@ -2833,6 +3189,7 @@ export class SalonRepositoryHub {
   public async updateSettings(
     changes: Partial<AppSettings>,
   ): Promise<AppSettings> {
+    this.markDirty('app_settings')
     const current =
       (await this.database.settings.get('default')) ?? buildDefaultSettings()
     const updated: AppSettings = {
@@ -2851,6 +3208,7 @@ export class SalonRepositoryHub {
     callerRole?: UserRole,
   ): Promise<CategoryItem> {
     this.assertManagerForServiceConfig(callerRole)
+    this.markDirty('categories')
     const next: Partial<CategoryItem> = {
       updatedAt: new Date().toISOString(),
     }
@@ -2872,6 +3230,7 @@ export class SalonRepositoryHub {
     callerRole?: UserRole
   }): Promise<CategoryItem> {
     this.assertManagerForServiceConfig(input.callerRole)
+    this.markDirty('categories')
     const label = input.label.trim()
     if (label.length < 2) {
       throw new Error('Le nom de la catégorie est trop court.')
@@ -2957,6 +3316,9 @@ export class SalonRepositoryHub {
         stockMovements: state.stockMovements,
         budgets: state.budgets,
         recurringExpenses: state.recurringExpenses,
+        invoices: state.invoices,
+        clients: state.clients,
+        appointments: state.appointments,
         correctionLogs: state.correctionLogs,
       },
       tombstones: persistedTombstones.map((tb) => ({
@@ -3019,6 +3381,9 @@ export class SalonRepositoryHub {
       salary_payments: 'salaryPayments',
       budgets: 'budgets',
       correction_logs: 'correctionLogs',
+      invoices: 'invoices',
+      clients: 'clients',
+      appointments: 'appointments',
     }
 
     for (const [table, rows] of Object.entries(input.changes ?? {})) {
@@ -3140,6 +3505,9 @@ export class SalonRepositoryHub {
           remote.salaryPayments,
         )
         await mergeByUpdatedAt(this.database.budgets, remote.budgets)
+        await mergeByUpdatedAt(this.database.invoices, remote.invoices)
+        await mergeByUpdatedAt(this.database.clients, remote.clients)
+        await mergeByUpdatedAt(this.database.appointments, remote.appointments)
 
         // Les comptes ne sont jamais fusionnés depuis un payload distant
         // (audit §6.1 S1) : ils passent uniquement par /api/users*.
@@ -3288,6 +3656,20 @@ export class SalonRepositoryHub {
             case 'correction_log':
               await applyTombstoneToImmutable(
                 this.database.correctionLogs,
+                tb.entityId,
+                tb.deletedAt,
+              )
+              break
+            case 'client':
+              await applyTombstoneToMutable(
+                this.database.clients,
+                tb.entityId,
+                tb.deletedAt,
+              )
+              break
+            case 'appointment':
+              await applyTombstoneToMutable(
+                this.database.appointments,
                 tb.entityId,
                 tb.deletedAt,
               )
@@ -3566,6 +3948,28 @@ export class SalonRepositoryHub {
     )
 
     await this.purgeLegacyMockData()
+  }
+
+  public async purgeLocalDatabase(): Promise<void> {
+    // Purge toutes les données métier liées au salon courant, à l'exception
+    // des comptes locaux (users) qui sont globaux et conservés d'un salon à
+    // l'autre. Appelé avant une bascule de salon pour éviter l'affichage de
+    // données d'un salon précédent en attendant la resynchronisation cloud.
+    await this.database.transaction(
+      'rw',
+      this.database.tables,
+      async () => {
+        const preservedUsers = await this.database.users.toArray()
+        await Promise.all(this.database.tables.map((t) => t.clear()))
+        if (preservedUsers.length > 0) {
+          await this.database.users.bulkPut(preservedUsers)
+        }
+      },
+    )
+  }
+
+  public async tableCount(tableName: string): Promise<number> {
+    return this.database.table(tableName).count()
   }
 
   public async resetAllDataWithConfirmation(

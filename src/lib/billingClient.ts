@@ -1,4 +1,4 @@
-import { readStoredSessionTokens } from './sessionClient'
+import { fetchWithSession, readStoredSessionTokens } from './sessionClient'
 
 /**
  * Client navigateur de la facturation (P1 — Sprint 7).
@@ -145,4 +145,123 @@ export async function cancelSubscription(): Promise<SubscriptionSnapshot> {
   return requestJson<SubscriptionSnapshot>('/api/billing/cancel', {
     method: 'POST',
   })
+}
+
+/* -------------------------------------------------------------------------- */
+/* Extensions Sprint 3 : moyens de paiement PSP (Wave / CinetPay / PayDunya) */
+/* -------------------------------------------------------------------------- */
+
+export interface PaymentTransaction {
+  id: string
+  reference: string
+  provider: string
+  orgId: string
+  planCode: string | null
+  amountFcfa: number
+  status: string
+  callbackUrl: string | null
+  returnUrl: string | null
+  metadata: unknown
+  createdAt: string
+  updatedAt: string
+  paidAt: string | null
+  pspTransactionId: string | null
+  failureReason: string | null
+}
+
+export interface Reminder {
+  id: string
+  orgId: string
+  type: string
+  reminderDay: number
+  sentAt: string
+  createdAt: string
+}
+
+export interface PaymentInitResult {
+  ok: boolean
+  transactionId: string
+  reference: string
+  provider: string
+  amountFcfa: number
+  planCode: string
+  paymentUrl: string
+  status: string
+}
+
+async function readJson(response: Response): Promise<Record<string, unknown>> {
+  return (await response.json().catch(() => ({}))) as Record<string, unknown>
+}
+
+function toError(
+  _response: Response,
+  payload: Record<string, unknown>,
+  fallback: string,
+): Error {
+  return new Error(
+    typeof payload.message === 'string' ? payload.message : fallback,
+  )
+}
+
+/** Initialise un paiement auprès d'un prestataire (Wave / CinetPay / PayDunya). */
+export async function initiatePayment(input: {
+  provider: string
+  planCode?: string
+  returnUrl?: string
+}): Promise<PaymentInitResult> {
+  const response = await fetchWithSession('/api/billing/payment/init', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      provider: input.provider,
+      planCode: input.planCode ?? undefined,
+      returnUrl: input.returnUrl ?? undefined,
+    }),
+  })
+  const payload = await readJson(response)
+  if (!response.ok) throw toError(response, payload, 'Impossible d’initier le paiement.')
+  return payload as unknown as PaymentInitResult
+}
+
+/** Historique des transactions de paiement du salon. */
+export async function fetchPaymentTransactions(): Promise<PaymentTransaction[]> {
+  const response = await fetchWithSession('/api/billing/payment/transactions')
+  const payload = await readJson(response)
+  if (!response.ok) throw toError(response, payload, 'Impossible de charger les transactions.')
+  const rows = Array.isArray(payload.transactions) ? payload.transactions : []
+  return rows.map((r: Record<string, unknown>) => ({
+    id: String(r.id ?? ''),
+    reference: String(r.reference ?? ''),
+    provider: String(r.provider ?? ''),
+    orgId: String(r.orgId ?? r.org_id ?? ''),
+    planCode: (r.planCode ?? r.plan_code ?? null) as string | null,
+    amountFcfa: typeof r.amountFcfa === 'number' ? r.amountFcfa : 0,
+    status: String(r.status ?? 'pending'),
+    callbackUrl: (r.callbackUrl ?? r.callback_url ?? null) as string | null,
+    returnUrl: (r.returnUrl ?? r.return_url ?? null) as string | null,
+    metadata: r.metadata ?? null,
+    createdAt: String(r.createdAt ?? r.created_at ?? ''),
+    updatedAt: String(r.updatedAt ?? r.updated_at ?? ''),
+    paidAt: (r.paidAt ?? r.paid_at ?? null) as string | null,
+    pspTransactionId: (r.pspTransactionId ?? r.psp_transaction_id ?? null) as string | null,
+    failureReason: (r.failureReason ?? r.failure_reason ?? null) as string | null,
+  }))
+}
+
+/** Déclenche la vérification des relances d'échéance (canal plateforme uniquement). */
+export async function checkExpirationReminders(): Promise<{
+  ok: boolean
+  reminders: Reminder[]
+  count: number
+}> {
+  const response = await fetchWithSession('/api/billing/reminders/check', {
+    method: 'POST',
+  })
+  const payload = await readJson(response)
+  if (!response.ok) throw toError(response, payload, 'Impossible de vérifier les relances.')
+  return {
+    ok: Boolean(payload.ok),
+    reminders: Array.isArray(payload.reminders) ? (payload.reminders as Reminder[]) : [],
+    count: typeof payload.count === 'number' ? payload.count : 0,
+  }
 }

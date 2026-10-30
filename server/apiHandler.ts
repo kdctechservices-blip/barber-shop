@@ -36,7 +36,12 @@ import {
   syncWithNeonDatabase,
   type CloudSyncEnvelope,
 } from './syncEngine.ts'
-import { isSessionActive } from './sessions.ts'
+import { isSessionActive, revokeSessionById } from './sessions.ts'
+import {
+  type NotificationChannel,
+  type NotificationSendRequest,
+  type NotificationType,
+} from '../src/domain/notifications/notificationService.ts'
 import {
   BILLING_PERIOD_DAYS,
   DEFAULT_PLAN_CODE,
@@ -45,6 +50,7 @@ import {
   TRIAL_PLAN_CODE,
   isPlanCode,
   planCatalogPublic,
+  type PlanCode,
 } from './plans.ts'
 import {
   PlanLimitError,
@@ -54,7 +60,19 @@ import {
   requestPlanChange,
   type TenantPlanContext,
 } from './subscriptions.ts'
+import {
+  getPaymentProvider,
+  listPaymentProviders,
+  providerConfigured,
+  planPriceFcfa,
+  makePaymentReference,
+  type PaymentProviderCode,
+  type PaymentStatus,
+  type PaymentTransaction,
+} from './paymentProvider.ts'
+import { checkExpirationReminders } from './billingReminders.ts'
 import { resolveDefaultTenantId, withTenantClient } from './tenantContext.ts'
+import { runMaintenancePurge } from './maintenance.ts'
 
 export interface ApiHandlerOptions {
   poolOverride?: SqlPoolLike | null
@@ -260,6 +278,21 @@ export async function handleSalonApiRequest(
     options.poolOverride !== undefined
       ? options.poolOverride
       : getNeonPool(dbUrl)
+
+  /**
+   * Fournisseur de notifications côté serveur. Implémentation NoOp par défaut :
+   * les notifications sont acceptées mais non transmettre à un opérateur SMS/WhatsApp
+   * tant qu'aucun fournisseur réel n'est configuré (aucun secret codé en dur).
+   */
+  class NoOpServerNotificationProvider {
+    async send(request: NotificationSendRequest): Promise<{ ok: boolean; messageId?: string; error?: string }> {
+      console.info(
+        `[notification] NoOp envoi ${request.channel}:${request.type} vers ${request.to} (${request.salonName})`,
+      )
+      return { ok: true, messageId: `noop-${Date.now()}` }
+    }
+  }
+  const notificationProvider = new NoOpServerNotificationProvider()
 
   let callerSession: SessionTokenPayload | null = null
   try {
@@ -775,6 +808,204 @@ export async function handleSalonApiRequest(
       return true
     }
 
+    // --- Routes de paiement PSP (webhook / relances) — aucun jeton client requis ---
+    // Le PSP appelle ce callback sans session : le canal est authentifié par le
+    // prestataire (signature / clé secrète), jamais par un utilisateur salon.
+    if (pathname === '/api/billing/payment/callback' && req.method === 'POST') {
+      try {
+        const body = (await readJsonBody(req)) as Record<string, unknown>
+        let matched: {
+          provider: PaymentProviderCode
+          transactionId: string
+          reference: string
+          status: PaymentStatus
+          amountFcfa: number
+          pspTransactionId?: string
+          raw: unknown
+        } | null = null
+        for (const code of listPaymentProviders()) {
+          const result = await getPaymentProvider(code).verifyCallback({
+            body,
+            headers: req.headers as Record<string, string | string[] | undefined>,
+          })
+          if (result) {
+            matched = { provider: code, ...result }
+            break
+          }
+        }
+        if (!matched) {
+          sendJson(res, 400, {
+            ok: false,
+            code: 'UNKNOWN_PAYMENT_CALLBACK',
+            message:
+              'Impossible d’identifier le prestataire de paiement pour ce webhook.',
+          })
+          return true
+        }
+        if (!pool) {
+          sendJson(res, 503, {
+            ok: false,
+            code: 'DB_NOT_CONFIGURED',
+            message:
+              'DATABASE_URL n’est pas configurée côté serveur : paiement indisponible.',
+          })
+          return true
+        }
+        // Mettre à jour la transaction et activer l’abonnement si payé.
+        const existing = await pool.query<PaymentTransaction & { org_id: string; plan_code: string | null; amount_fcfa: number }>(
+          `SELECT id, reference, provider, org_id, plan_code, amount_fcfa, status
+             FROM payment_transactions
+            WHERE reference = $1`,
+          [matched.reference],
+        )
+        if (existing.rows.length === 0) {
+          sendJson(res, 404, {
+            ok: false,
+            code: 'TRANSACTION_NOT_FOUND',
+            message: `Aucune transaction trouvée pour la référence ${matched.reference}.`,
+          })
+          return true
+        }
+        const tx = existing.rows[0]
+        const newStatus = matched.status === 'paid' ? 'paid' : matched.status
+        await pool.query(
+          `UPDATE payment_transactions
+              SET status = $2, updated_at = $3, psp_transaction_id = COALESCE($4, psp_transaction_id),
+                  paid_at = CASE WHEN $2 = 'paid' THEN $3 ELSE paid_at END,
+                  failure_reason = CASE WHEN $2 = 'failed' THEN $5 ELSE failure_reason END
+            WHERE reference = $1`,
+          [
+            matched.reference,
+            newStatus,
+            new Date().toISOString(),
+            matched.pspTransactionId,
+            matched.status === 'failed' ? 'Paiement refusé par le prestataire' : null,
+          ],
+        )
+        let activated = false
+        if (newStatus === 'paid' && tx.status !== 'paid') {
+          const planCode = (tx.plan_code as PlanCode | undefined) ?? undefined
+          const months = tx.amount_fcfa > 0 ? 1 : 1
+          await activateSubscriptionForOrg(pool, {
+            orgId: tx.org_id,
+            planCode,
+            months,
+            reference: matched.reference,
+          })
+          activated = true
+        }
+        console.info(
+          `[audit] billing.payment.callback provider=${matched.provider} reference=${matched.reference} status=${matched.status} activated=${activated}`,
+        )
+        sendJson(res, 200, {
+          ok: true,
+          provider: matched.provider,
+          reference: matched.reference,
+          status: matched.status,
+          activated,
+        })
+      } catch (err) {
+        const formatted = formatDbError(err)
+        sendJson(res, formatted.status ?? 500, {
+          ok: false,
+          code: formatted.code ?? 'PAYMENT_CALLBACK_ERROR',
+          message: formatted.message ?? 'Erreur de traitement du callback de paiement.',
+        })
+      }
+      return true
+    }
+
+    if (pathname === '/api/billing/reminders/check' && req.method === 'POST') {
+      const platformCheck = verifyManagerPin(extractPinFromHeaders(req), expectedPin)
+      if (!platformCheck.pinConfigured) {
+        sendJson(res, 503, {
+          ok: false,
+          code: 'PLATFORM_CHANNEL_DISABLED',
+          message:
+            "Le canal plateforme n'est pas configuré (SALON_SYNC_PIN absent).",
+        })
+        return true
+      }
+      if (!platformCheck.authorized) {
+        sendJson(res, 403, {
+          ok: false,
+          code: 'PLATFORM_SECRET_REQUIRED',
+          message: 'Relances réservées à la plateforme : code serveur invalide.',
+        })
+        return true
+      }
+      if (!pool) {
+        sendJson(res, 503, {
+          ok: false,
+          code: 'DB_NOT_CONFIGURED',
+          message: 'DATABASE_URL n’est pas configurée côté serveur.',
+        })
+        return true
+      }
+      try {
+        const reminders = await checkExpirationReminders(pool)
+        console.info(
+          `[audit] billing.reminders.check created=${reminders.length} actor=platform`,
+        )
+        sendJson(res, 200, {
+          ok: true,
+          reminders,
+          count: reminders.length,
+        })
+      } catch (err) {
+        const formatted = formatDbError(err)
+        sendJson(res, formatted.status, {
+          ok: false,
+          code: formatted.code,
+          message: formatted.message,
+        })
+      }
+      return true
+    }
+
+    // ------------------------------------------------------------------
+    // Route /api/notifications/send : envoi de notifications SMS/WhatsApp.
+    // Utilise un NotificationProvider configuré côté serveur (sans secret client).
+    // ------------------------------------------------------------------
+    if (pathname === '/api/notifications/send' && req.method === 'POST') {
+      if (!callerSession) {
+        sendJson(res, 401, {
+          ok: false,
+          code: 'SESSION_REQUIRED',
+          message: 'Connectez-vous pour envoyer une notification.',
+        })
+        return true
+      }
+      try {
+        const body = (await readJsonBody(req)) as Partial<NotificationSendRequest>
+        if (!body || !body.type || !body.channel || !body.to) {
+          sendJson(res, 400, {
+            ok: false,
+            code: 'INVALID_REQUEST',
+            message: 'Champs requis : type, channel, to.',
+          })
+          return true
+        }
+        const result = await notificationProvider.send({
+          type: body.type as NotificationType,
+          channel: body.channel as NotificationChannel,
+          to: body.to,
+          salonName: body.salonName ?? '',
+          clientName: body.clientName,
+          variables: body.variables,
+        })
+        sendJson(res, 200, { ok: result.ok, messageId: result.messageId, error: result.error })
+      } catch (err) {
+        const formatted = formatDbError(err)
+        sendJson(res, formatted.status, {
+          ok: false,
+          code: formatted.code,
+          message: formatted.message,
+        })
+      }
+      return true
+    }
+
     if (!callerSession) {
       sendJson(res, 401, {
         ok: false,
@@ -901,6 +1132,149 @@ export async function handleSalonApiRequest(
       return true
     }
 
+    // --- Routes de paiement initiées par le gestionnaire (session requise) ---
+    if (pathname === '/api/billing/payment/init' && req.method === 'POST') {
+      if (callerSession.role !== 'manager') {
+        sendJson(res, 403, {
+          ok: false,
+          code: 'MANAGER_ROLE_REQUIRED',
+          message: 'Seul un compte Gérant peut initier un paiement d’abonnement.',
+        })
+        return true
+      }
+      if (
+        rejectWhenRateLimited(
+          res,
+          consumeRateLimit(`billing:${callerSession.uid}`, RATE_LIMITS.userAdminPerActor),
+          "Trop d'opérations de paiement. Réessayez dans quelques minutes.",
+        )
+      ) {
+        return true
+      }
+      try {
+        const plan = await readTenantPlan(pool, callerSession.tid)
+        const body = (await readJsonBody(req)) as {
+          provider?: unknown
+          planCode?: unknown
+          returnUrl?: unknown
+        }
+        const providerCode =
+          typeof body?.provider === 'string'
+            ? (body.provider as PaymentProviderCode)
+            : null
+        if (!providerCode || !listPaymentProviders().includes(providerCode)) {
+          sendJson(res, 400, {
+            ok: false,
+            code: 'INVALID_PROVIDER',
+            message:
+              'Prestataire inconnu : utilisez wave, cinetpay ou paydunya.',
+          })
+          return true
+        }
+        if (!providerConfigured(providerCode)) {
+          sendJson(res, 503, {
+            ok: false,
+            code: 'PROVIDER_NOT_CONFIGURED',
+            message: `Le canal ${providerCode} n’est pas configuré côté serveur.`,
+          })
+          return true
+        }
+        const targetPlanCode =
+          typeof body?.planCode === 'string' && isPlanCode(body.planCode)
+            ? body.planCode
+            : null
+        const planToBill = targetPlanCode ?? plan.effective.planCode
+        const amountFcfa = planPriceFcfa(planToBill)
+        if (amountFcfa === null) {
+          sendJson(res, 400, {
+            ok: false,
+            code: 'NO_PAYMENT_REQUIRED',
+            message: `L'offre ${planToBill} ne nécessite pas de paiement (gratuite ou sur devis).`,
+          })
+          return true
+        }
+        const reference = makePaymentReference()
+        const callbackUrl = `${process.env.SALON_PUBLIC_BASE_URL ?? ''}/api/billing/payment/callback`
+        const returnUrl =
+          typeof body?.returnUrl === 'string' && body.returnUrl.trim()
+            ? body.returnUrl
+            : `${process.env.SALON_PUBLIC_BASE_URL ?? ''}/billing/payment/return`
+        const { paymentUrl, transactionId } = await getPaymentProvider(
+          providerCode,
+        ).initiatePayment({
+          reference,
+          amountFcfa,
+          orgId: plan.orgId,
+          planCode: planToBill,
+          callbackUrl,
+          returnUrl,
+          description: `Abonnement SALON PRO — ${planToBill}`,
+        })
+        await pool.query(
+          `INSERT INTO payment_transactions (id, reference, provider, org_id, plan_code, amount_fcfa, status, callback_url, return_url, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9, $9)`,
+          [
+            transactionId,
+            reference,
+            providerCode,
+            plan.orgId,
+            planToBill,
+            amountFcfa,
+            callbackUrl,
+            returnUrl,
+            new Date().toISOString(),
+          ],
+        )
+        console.info(
+          `[audit] billing.payment.init provider=${providerCode} reference=${reference} amount=${amountFcfa} org=${plan.orgId} actor=${callerSession.uid}`,
+        )
+        sendJson(res, 201, {
+          ok: true,
+          transactionId,
+          reference,
+          provider: providerCode,
+          amountFcfa,
+          planCode: planToBill,
+          paymentUrl,
+          status: 'pending',
+        })
+      } catch (err) {
+        const formatted = formatDbError(err)
+        sendJson(res, formatted.status ?? 500, {
+          ok: false,
+          code: formatted.code ?? 'PAYMENT_INIT_ERROR',
+          message: formatted.message ?? 'Impossible d’initier le paiement.',
+        })
+      }
+      return true
+    }
+
+    if (pathname === '/api/billing/payment/transactions' && req.method === 'GET') {
+      try {
+        const plan = await readTenantPlan(pool, callerSession.tid)
+        const rows = await pool.query<PaymentTransaction & { org_id: string }>(
+          `SELECT id, reference, provider, org_id, plan_code, amount_fcfa, status, callback_url, return_url, metadata, created_at, updated_at, paid_at, psp_transaction_id, failure_reason
+             FROM payment_transactions
+            WHERE org_id = $1
+            ORDER BY created_at DESC`,
+          [plan.orgId],
+        )
+        sendJson(res, 200, {
+          ok: true,
+          transactions: rows.rows,
+          count: rows.rows.length,
+        })
+      } catch (err) {
+        const formatted = formatDbError(err)
+        sendJson(res, formatted.status, {
+          ok: false,
+          code: formatted.code,
+          message: formatted.message,
+        })
+      }
+      return true
+    }
+
     sendJson(res, 404, {
       ok: false,
       code: 'NOT_FOUND',
@@ -909,9 +1283,148 @@ export async function handleSalonApiRequest(
     return true
   }
 
-  // 4. Routes /api/sync* : exigent soit un jeton de session signé valide, soit un code serveur SALON_SYNC_PIN configuré
   const pinCheck = verifyManagerPin(extractPinFromHeaders(req), expectedPin)
   const authorizedByPin = pinCheck.pinConfigured && pinCheck.authorized
+
+  // 3b. Routes maintenance (/api/maintenance*) — réservée au Gérant ou au canal plateforme
+  if (pathname === '/api/maintenance/purge' && req.method === 'POST') {
+    if (!callerSession && !authorizedByPin) {
+      sendJson(res, 401, {
+        ok: false,
+        code: 'SESSION_OR_PIN_REQUIRED',
+        message:
+          'Authentification Gérant ou code serveur requis pour la maintenance.',
+      })
+      return true
+    }
+    if (callerSession && callerSession.role !== 'manager') {
+      sendJson(res, 403, {
+        ok: false,
+        code: 'MANAGER_ROLE_REQUIRED',
+        message: 'Seul un compte Gérant peut lancer la purge de maintenance.',
+      })
+      return true
+    }
+    if (!pool) {
+      sendJson(res, 503, {
+        ok: false,
+        code: 'DB_NOT_CONFIGURED',
+        message: 'DATABASE_URL n\'est pas configurée côté serveur.',
+      })
+      return true
+    }
+    try {
+      const result = await runMaintenancePurge(pool)
+      console.info(
+        `[audit] maintenance.purge sessions=${result.sessions} syncChanges=${result.syncChanges} subscriptionEvents=${result.subscriptionEvents} actor=${callerSession?.uid ?? 'platform'}`,
+      )
+      sendJson(res, 200, { ok: true, ...result })
+    } catch (err) {
+      const formatted = formatDbError(err)
+      sendJson(res, formatted.status, {
+        ok: false,
+        code: formatted.code,
+        message: formatted.message,
+      })
+    }
+    return true
+  }
+
+  // 3c. Routes sessions connectées (/api/sessions*) — réservée au compte authentifié
+  if (pathname === '/api/sessions' && req.method === 'GET') {
+    if (!callerSession) {
+      sendJson(res, 401, {
+        ok: false,
+        code: 'SESSION_REQUIRED',
+        message: 'Connexion requise pour lister les appareils.',
+      })
+      return true
+    }
+    if (!pool) {
+      sendJson(res, 503, {
+        ok: false,
+        code: 'DB_NOT_CONFIGURED',
+        message: 'DATABASE_URL n\'est pas configurée côté serveur.',
+      })
+      return true
+    }
+    try {
+      const result = await pool.query<{
+        id: string
+        email: string
+        role: string
+        created_at: string
+        expires_at: string
+        last_used_at: string | null
+        revoked_at: string | null
+        revoked_reason: string | null
+        user_agent: string | null
+        ip: string | null
+      }>(
+        `SELECT id, email, role, created_at, expires_at, last_used_at, revoked_at, revoked_reason, user_agent, ip
+         FROM sessions
+         WHERE tenant_id = $1
+         ORDER BY created_at DESC`,
+        [callerSession.tid],
+      )
+      sendJson(res, 200, { ok: true, sessions: result.rows })
+    } catch (err) {
+      const formatted = formatDbError(err)
+      sendJson(res, formatted.status, {
+        ok: false,
+        code: formatted.code,
+        message: formatted.message,
+      })
+    }
+    return true
+  }
+
+  if (pathname.startsWith('/api/sessions/') && req.method === 'DELETE') {
+    if (!callerSession) {
+      sendJson(res, 401, {
+        ok: false,
+        code: 'SESSION_REQUIRED',
+        message: 'Connexion requise pour révoquer un appareil.',
+      })
+      return true
+    }
+    if (!pool) {
+      sendJson(res, 503, {
+        ok: false,
+        code: 'DB_NOT_CONFIGURED',
+        message: 'DATABASE_URL n\'est pas configurée côté serveur.',
+      })
+      return true
+    }
+    try {
+      const sessionId = decodeURIComponent(
+        pathname.slice('/api/sessions/'.length),
+      ).trim()
+      if (!sessionId) {
+        sendJson(res, 400, {
+          ok: false,
+          code: 'INVALID_SESSION_ID',
+          message: 'Identifiant de session manquant.',
+        })
+        return true
+      }
+      const revoked = await revokeSessionById(pool, sessionId)
+      console.info(
+        `[audit] session.revoke sessionId=${sessionId} actor=${callerSession.uid}`,
+      )
+      sendJson(res, 200, { ok: true, revoked: revoked > 0 })
+    } catch (err) {
+      const formatted = formatDbError(err)
+      sendJson(res, formatted.status, {
+        ok: false,
+        code: formatted.code,
+        message: formatted.message,
+      })
+    }
+    return true
+  }
+
+  // 4. Routes /api/sync* : exigent soit un jeton de session signé valide, soit un code serveur SALON_SYNC_PIN configuré
   if (!authorizedByPin && !callerSession) {
     sendJson(res, 401, {
       ok: false,

@@ -82,6 +82,9 @@ function buildPayload(options: {
     budgets: [],
     recurringExpenses: [],
     correctionLogs: [],
+    invoices: [],
+    clients: [],
+    appointments: [],
   }
 }
 

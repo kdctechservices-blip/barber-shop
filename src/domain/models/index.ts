@@ -67,6 +67,9 @@ export type SyncTombstoneEntityType =
   | 'stock_movement'
   | 'budget'
   | 'correction_log'
+  | 'invoice'
+  | 'client'
+  | 'appointment'
 
 export interface PersistedSyncTombstone {
   id: string // `${entityType}:${entityId}`
@@ -377,6 +380,38 @@ export interface RecurringExpenseTemplate {
   updatedAt: string
 }
 
+export interface InvoiceItem {
+  id: string
+  label: string
+  description?: string
+  quantity: number
+  unitPrice: number
+  amount: number
+  categoryCode?: string
+  serviceId?: string
+  productId?: string
+}
+
+export type InvoicePaymentStatus = 'pending' | 'paid' | 'partial' | 'overdue' | 'cancelled'
+
+export interface Invoice {
+  id: string
+  invoiceNumber: string
+  date: string // ISO datetime
+  clientName?: string
+  clientPhone?: string
+  items: InvoiceItem[]
+  subtotal: number
+  taxAmount: number
+  total: number
+  paymentMethod: PaymentMethodCode
+  paymentStatus: InvoicePaymentStatus
+  linkedRevenueId?: string
+  isArchived?: boolean
+  createdAt: string
+  updatedAt: string
+}
+
 export type UserRole = 'manager' | 'cashier'
 
 export interface SalonUserAccount {
@@ -392,6 +427,60 @@ export interface SalonUserAccount {
   updatedAt: string
   /** Salon (tenant) d'appartenance — attribué par le serveur, jamais par le client. */
   tenantId?: string
+}
+
+export type ClientSource = 'walkin' | 'booking' | 'import'
+
+export type ClientLoyaltyTier = 'bronze' | 'silver' | 'gold' | 'vip'
+
+export interface Client {
+  id: string
+  firstName: string
+  lastName: string
+  fullName: string
+  phone?: string
+  email?: string
+  source: ClientSource
+  loyaltyPoints: number
+  loyaltyTier: ClientLoyaltyTier
+  totalVisits: number
+  totalSpent: number
+  lastVisitAt?: string
+  note?: string
+  isActive: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ClientStats {
+  totalClients: number
+  activeClients: number
+  newClientsThisMonth: number
+  topClients: Array<{ id: string; fullName: string; totalSpent: number; totalVisits: number }>
+}
+
+export type AppointmentStatus = 'pending' | 'confirmed' | 'completed' | 'cancelled' | 'no_show'
+
+export type AppointmentSource = 'walkin' | 'booking' | 'phone'
+
+export interface Appointment {
+  id: string
+  clientId: string
+  clientName: string
+  serviceId: string
+  serviceName: string
+  employeeId?: string
+  employeeName?: string
+  startAt: string // ISO datetime
+  endAt: string // ISO datetime
+  status: AppointmentStatus
+  source: AppointmentSource
+  amount: number // FCFA
+  paymentStatus: 'pending' | 'paid' | 'partial' | 'refunded'
+  note?: string
+  reminderSent: boolean
+  createdAt: string
+  updatedAt: string
 }
 
 export type PublicSalonUser = Omit<SalonUserAccount, 'passwordHash'>
@@ -415,11 +504,14 @@ export interface SalonBackupPayload {
   stockMovements: StockMovement[]
   budgets: BudgetTarget[]
   recurringExpenses?: RecurringExpenseTemplate[]
+  invoices: Invoice[]
   /**
    * Comptes utilisateurs — utilisés UNIQUEMENT par la sauvegarde/restauration
    * JSON locale (action explicite du Gérant). Ils ne sont JAMAIS transmis au
    * Cloud : voir `buildCloudSyncEnvelope` et `/api/users/provision`.
    */
   users?: SalonUserAccount[]
+  clients: Client[]
+  appointments: Appointment[]
   correctionLogs: CorrectionLog[]
 }

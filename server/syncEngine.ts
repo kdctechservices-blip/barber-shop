@@ -6,9 +6,12 @@ import type {
   CashMovement,
   CashSession,
   CategoryItem,
+  Client,
   CorrectionLog,
   Employee,
+  Appointment,
   ExpenseEntry,
+  Invoice,
   ProductItem,
   RecurringExpenseTemplate,
   RevenueEntry,
@@ -58,6 +61,9 @@ const TOMBSTONE_TABLE_MAP: Record<
   stock_movement: { table: 'stock_movements', tsCol: 'created_at' },
   budget: { table: 'budgets', tsCol: 'updated_at' },
   correction_log: { table: 'correction_logs', tsCol: 'created_at' },
+  invoice: { table: 'invoices', tsCol: 'updated_at' },
+  client: { table: 'clients', tsCol: 'updated_at' },
+  appointment: { table: 'appointments', tsCol: 'updated_at' },
 }
 
 export interface CloudSyncEnvelope {
@@ -198,6 +204,9 @@ export async function readFullCloudState(
     budgetsClean,
     users,
     correctionLogsClean,
+    invoicesClean,
+    clientsClean,
+    appointmentsClean,
     tombstoneRes,
   ] = await Promise.all([
     readRows<SalonInfo>(db, 'salon_info', 'updated_at'),
@@ -265,6 +274,9 @@ export async function readFullCloudState(
       'correction_log',
       'created_at',
     ),
+    readAndPurgeMockRows<Invoice>(db, 'invoices', 'invoice', 'updated_at'),
+    readRows<Client>(db, 'clients', 'updated_at'),
+    readRows<Appointment>(db, 'appointments', 'updated_at'),
     db.query<{
       entity_type: SyncTombstoneEntityType
       entity_id: string
@@ -294,7 +306,8 @@ export async function readFullCloudState(
     salaryPaymentsClean.length +
     budgetsClean.length +
     recurringClean.length +
-    correctionLogsClean.length
+    correctionLogsClean.length +
+    invoicesClean.length
 
   const activeManager =
     users.find((u) => u.role === 'manager' && u.isActive) ?? users[0] ?? null
@@ -366,6 +379,9 @@ export async function readFullCloudState(
       // `users` est volontairement exclu : les comptes (rôles + hashes) ne sont
       // jamais exposés à un client via la synchronisation (audit §6.1 S1).
       correctionLogs: correctionLogsClean,
+      invoices: invoicesClean,
+      clients: clientsClean,
+      appointments: appointmentsClean,
     },
     tombstones,
     totalRemoteRecords,
@@ -403,6 +419,9 @@ const DELTA_TABLES: Array<{
   { table: 'salary_payments', key: 'salaryPayments' },
   { table: 'budgets', key: 'budgets' },
   { table: 'correction_logs', key: 'correctionLogs' },
+  { table: 'invoices', key: 'invoices' },
+  { table: 'clients', key: 'clients' },
+  { table: 'appointments', key: 'appointments' },
 ]
 
 interface ChangeEntry {
@@ -1253,6 +1272,51 @@ export async function syncWithNeonDatabase(
           log.reason,
           log.createdAt,
           JSON.stringify(log),
+        ],
+      )
+      pushedRecords += r.rowCount ?? 0
+    }
+
+    // 14. Invoices
+    for (const inv of (p.invoices ?? []).filter(
+      (x) => !isLegacyMockRecord(x),
+    )) {
+      const r = await client.query(
+        `INSERT INTO invoices (id, invoice_number, date, client_name, client_phone, items, subtotal, tax_amount, total, payment_method, payment_status, linked_revenue_id, is_archived, created_at, updated_at, payload_json)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb)
+         ON CONFLICT (id) DO UPDATE SET
+           invoice_number = EXCLUDED.invoice_number,
+           date = EXCLUDED.date,
+           client_name = EXCLUDED.client_name,
+           client_phone = EXCLUDED.client_phone,
+           items = EXCLUDED.items,
+           subtotal = EXCLUDED.subtotal,
+           tax_amount = EXCLUDED.tax_amount,
+           total = EXCLUDED.total,
+           payment_method = EXCLUDED.payment_method,
+           payment_status = EXCLUDED.payment_status,
+           linked_revenue_id = EXCLUDED.linked_revenue_id,
+           is_archived = EXCLUDED.is_archived,
+           updated_at = EXCLUDED.updated_at,
+           payload_json = EXCLUDED.payload_json
+         WHERE invoices.payload_json IS DISTINCT FROM EXCLUDED.payload_json`,
+        [
+          inv.id,
+          inv.invoiceNumber,
+          inv.date,
+          inv.clientName ?? null,
+          inv.clientPhone ?? null,
+          JSON.stringify(inv.items),
+          Math.round(inv.subtotal),
+          Math.round(inv.taxAmount),
+          Math.round(inv.total),
+          inv.paymentMethod,
+          inv.paymentStatus,
+          inv.linkedRevenueId ?? null,
+          Boolean(inv.isArchived),
+          inv.createdAt,
+          inv.updatedAt,
+          JSON.stringify(inv),
         ],
       )
       pushedRecords += r.rowCount ?? 0

@@ -267,6 +267,55 @@ describe('Parcours transactionnels complets (Section 23 — Scénarios 1 à 10)'
     expect(afterRestore.revenues[0].label).toBe('Brushing complet')
   })
 
+  it('Purge de la base locale à la bascule de salon : vide les tables métier, préserve les comptes locaux', async () => {
+    const now = new Date().toISOString()
+    const db = (repo as any).database as {
+      table: (name: string) => { put: (r: unknown) => Promise<void>; count: () => Promise<number>; toArray: () => Promise<unknown[]> }
+    }
+
+    // Peupler plusieurs tables métier avec des données de test.
+    await db.table('salon').put({ id: 'salon-test', name: 'Test Salon' })
+    await db.table('settings').put({ id: 'default', theme: 'dark', updatedAt: now })
+    await db.table('categories').put({ id: 'cat-1', scope: 'revenue', code: 'c', label: 'Test', isArchived: false })
+    await db.table('services').put({ id: 'svc-1', categoryCode: 'c', label: 'Test', isActive: true })
+    await db.table('employees').put({ id: 'emp-1', fullName: 'Emp', role: 'cashier', isActive: true, hireDate: now })
+    await db.table('revenues').put({ id: 'rev-1', date: now, label: 'R', amount: 100, categoryCode: 'c', paymentMethod: 'cash', isArchived: false })
+    await db.table('expenses').put({ id: 'exp-1', date: now, label: 'E', amount: 100, categoryCode: 'c', paymentMethod: 'cash', isArchived: false })
+    await db.table('products').put({ id: 'prod-1', sku: 'SKU', label: 'P', categoryCode: 'c', quantity: 10, alertThreshold: 2, isActive: true })
+    await db.table('stockMovements').put({ id: 'sm-1', productId: 'prod-1', type: 'in', occurredAt: now, quantity: 10 })
+    await db.table('cashSessions').put({ id: 'cash-1', status: 'open', openedAt: now })
+    await db.table('cashMovements').put({ id: 'cm-1', sessionId: 'cash-1', type: 'in', occurredAt: now, amount: 1000 })
+    await db.table('advances').put({ id: 'adv-1', employeeId: 'emp-1', periodMonth: '2026-10', amount: 2000, settledInPayrollId: null, isArchived: false })
+    await db.table('bonuses').put({ id: 'bon-1', employeeId: 'emp-1', periodMonth: '2026-10', amount: 1000 })
+    await db.table('salaryPayments').put({ id: 'sal-1', employeeId: 'emp-1', periodMonth: '2026-10', amount: 50000, status: 'paid' })
+    await db.table('budgets').put({ id: 'bud-1', periodMonth: '2026-10', kind: 'revenue', categoryCode: 'c', amount: 100000 })
+    await db.table('recurringExpenses').put({ id: 'rec-1', categoryCode: 'c', label: 'R', amount: 3000, isActive: true })
+    await db.table('correctionLogs').put({ id: 'corr-1', entityType: 'revenue', entityId: 'rev-1', createdAt: now })
+    await db.table('syncTombstones').put({ id: 't:rev-1', entityType: 'revenue', entityId: 'rev-1', deletedAt: now })
+
+    // Préserver un compte local (doit survivre à la purge).
+    await db.table('users').put({ id: 'user-1', email: 'test@salon.ci', fullName: 'U', role: 'manager', isActive: true, passwordHash: 'hash', createdAt: now, updatedAt: now })
+
+    // Purge.
+    await repo.purgeLocalDatabase()
+
+    // Toutes les tables métier doivent être vides.
+    const tableNames = [
+      'salon', 'settings', 'categories', 'services', 'employees', 'revenues',
+      'expenses', 'products', 'stockMovements', 'cashSessions', 'cashMovements',
+      'advances', 'bonuses', 'salaryPayments', 'budgets', 'recurringExpenses',
+      'correctionLogs', 'syncTombstones',
+    ]
+    for (const tableName of tableNames) {
+      const count = await repo.tableCount(tableName)
+      expect(count).toBe(0)
+    }
+
+    // Les comptes locaux doivent être préservés.
+    const users = await repo.tableCount('users')
+    expect(users).toBe(1)
+  })
+
   it('Scénarios 6 & 10 : Rendu UI des onglets, mention obligatoire mode local et export CSV des rapports', async () => {
     const user = userEvent.setup()
     const createObjSpy = vi

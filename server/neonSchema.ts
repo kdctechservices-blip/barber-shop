@@ -227,4 +227,93 @@ CREATE TABLE IF NOT EXISTS sync_tombstones (
   deleted_at TEXT NOT NULL,
   PRIMARY KEY (entity_type, entity_id)
 );
+
+CREATE TABLE IF NOT EXISTS invoices (
+  id TEXT PRIMARY KEY,
+  invoice_number TEXT NOT NULL,
+  date TEXT NOT NULL,
+  client_name TEXT,
+  client_phone TEXT,
+  items JSONB NOT NULL DEFAULT '[]',
+  subtotal BIGINT NOT NULL DEFAULT 0,
+  tax_amount BIGINT NOT NULL DEFAULT 0,
+  total BIGINT NOT NULL DEFAULT 0,
+  payment_method TEXT NOT NULL,
+  payment_status TEXT NOT NULL DEFAULT 'pending',
+  linked_revenue_id TEXT,
+  is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  payload_json JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices (date);
+CREATE INDEX IF NOT EXISTS idx_invoices_payment_status ON invoices (payment_status);
+CREATE INDEX IF NOT EXISTS idx_invoices_invoice_number ON invoices (invoice_number);
+
+CREATE TABLE IF NOT EXISTS payment_transactions (
+  id TEXT PRIMARY KEY,
+  reference TEXT NOT NULL UNIQUE,
+  provider TEXT NOT NULL,
+  org_id TEXT NOT NULL,
+  plan_code TEXT,
+  amount_fcfa BIGINT NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  callback_url TEXT,
+  return_url TEXT,
+  metadata JSONB DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  paid_at TEXT,
+  psp_transaction_id TEXT,
+  failure_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_payment_transactions_org ON payment_transactions (org_id);
+CREATE INDEX IF NOT EXISTS idx_payment_transactions_status ON payment_transactions (status);
+CREATE INDEX IF NOT EXISTS idx_payment_transactions_reference ON payment_transactions (reference);
+
+CREATE TABLE IF NOT EXISTS clients (
+  id TEXT PRIMARY KEY,
+  first_name TEXT NOT NULL,
+  last_name TEXT NOT NULL,
+  full_name TEXT NOT NULL,
+  phone TEXT,
+  email TEXT,
+  source TEXT NOT NULL DEFAULT 'walkin',
+  loyalty_points BIGINT NOT NULL DEFAULT 0,
+  loyalty_tier TEXT NOT NULL DEFAULT 'bronze',
+  total_visits BIGINT NOT NULL DEFAULT 0,
+  total_spent BIGINT NOT NULL DEFAULT 0,
+  last_visit_at TEXT,
+  note TEXT,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  payload_json JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_clients_phone ON clients (phone);
+CREATE INDEX IF NOT EXISTS idx_clients_is_active ON clients (is_active);
+
+CREATE TABLE IF NOT EXISTS appointments (
+  id TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  client_name TEXT NOT NULL,
+  service_id TEXT NOT NULL,
+  service_name TEXT NOT NULL,
+  employee_id TEXT,
+  employee_name TEXT,
+  start_at TEXT NOT NULL,
+  end_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  source TEXT NOT NULL DEFAULT 'walkin',
+  amount BIGINT NOT NULL DEFAULT 0,
+  payment_status TEXT NOT NULL DEFAULT 'pending',
+  note TEXT,
+  reminder_sent BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  payload_json JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_appointments_client_id ON appointments (client_id);
+CREATE INDEX IF NOT EXISTS idx_appointments_start_at ON appointments (start_at);
+CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments (status);
 `

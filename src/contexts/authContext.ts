@@ -41,8 +41,11 @@ export interface AuthContextValue {
 }
 
 export const MANAGER_ONLY_PREFIXES = [
+  '/billing',
   '/budget',
+  '/devices',
   '/employees',
+  '/invoices',
   '/payroll',
   '/reports',
   '/settings',
@@ -57,6 +60,122 @@ export function canUserAccessPath(
   return !MANAGER_ONLY_PREFIXES.some(
     (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
   )
+}
+
+/**
+ * Niveau d'accès à un champ par rôle.
+ * - 'readwrite' : lisible et modifiable par tous les rôles connectés.
+ * - 'read'      : lisible par tous, modifiable uniquement par le Gérant.
+ * - 'manager'   : lisible et modifiable uniquement par le Gérant (invisible pour le Caissier).
+ * - 'hidden'    : masqué pour le Caissier.
+ */
+export type FieldAccess = 'readwrite' | 'read' | 'manager' | 'hidden'
+
+/**
+ * Règles de droits par champ, par écran/formulaire.
+ * Clé = identifiant d'écran (ex: 'services', 'employees', 'settings', 'salon_info').
+ * Valeur = mapping nom de champ -> niveau d'accès.
+ */
+export const FIELD_PERMISSIONS: Record<
+  string,
+  Record<string, FieldAccess>
+> = {
+  services: {
+    name: 'readwrite',
+    categoryCode: 'readwrite',
+    durationMinutes: 'readwrite',
+    price: 'manager',
+    commissionRate: 'manager',
+    isActive: 'manager',
+    description: 'readwrite',
+  },
+  employees: {
+    fullName: 'readwrite',
+    email: 'readwrite',
+    phone: 'readwrite',
+    role: 'manager',
+    baseSalary: 'manager',
+    commissionRate: 'manager',
+    isActive: 'manager',
+    hireDate: 'readwrite',
+  },
+  settings: {
+    salonName: 'manager',
+    salonAddress: 'manager',
+    salonPhone: 'manager',
+    salonEmail: 'manager',
+    theme: 'readwrite',
+    currency: 'manager',
+    taxRate: 'manager',
+  },
+  salon_info: {
+    name: 'manager',
+    address: 'manager',
+    phone: 'manager',
+    email: 'manager',
+    siret: 'manager',
+    logoUrl: 'manager',
+  },
+  cash_session: {
+    openingAmount: 'readwrite',
+    closingAmount: 'read',
+    status: 'manager',
+  },
+}
+
+/**
+ * Retourne le niveau d'accès d'un champ pour un écran donné.
+ */
+export function getFieldAccess(
+  screen: string,
+  field: string,
+): FieldAccess {
+  return FIELD_PERMISSIONS[screen]?.[field] ?? 'readwrite'
+}
+
+/**
+ * Vérifie si un rôle donné peut écrire sur un champ d'un écran.
+ */
+export function canWriteField(
+  role: UserRole | undefined,
+  screen: string,
+  field: string,
+): boolean {
+  if (!role || role === 'manager') return true
+  const access = getFieldAccess(screen, field)
+  return access === 'readwrite'
+}
+
+/**
+ * Vérifie si un champ est visible pour un rôle donné.
+ */
+export function canSeeField(
+  role: UserRole | undefined,
+  screen: string,
+  field: string,
+): boolean {
+  if (!role || role === 'manager') return true
+  const access = getFieldAccess(screen, field)
+  return access !== 'hidden' && access !== 'manager'
+}
+
+export interface UseFieldAuthOptions {
+  screen: string
+}
+
+/**
+ * Hook exposant les helpers de droits par champ pour un écran donné.
+ */
+export function useFieldAuth(options: UseFieldAuthOptions) {
+  const { currentUser } = useAuth()
+  const role = currentUser?.role
+
+  return {
+    canWrite: (field: string) => canWriteField(role, options.screen, field),
+    canSee: (field: string) => canSeeField(role, options.screen, field),
+    role,
+    isManager: role === 'manager',
+  }
 }
 
 const FALLBACK_MANAGER_USER: PublicSalonUser = {

@@ -305,6 +305,70 @@ export const MIGRATIONS: Migration[] = [
     label: 'Abonnements par organisation et journal de facturation',
     sql: SUBSCRIPTIONS_SQL,
   },
+  {
+    id: '007_invoices',
+    label: 'Table de factures et historique de facturation',
+    sql: `
+CREATE TABLE IF NOT EXISTS invoices (
+  id TEXT PRIMARY KEY,
+  invoice_number TEXT NOT NULL,
+  date TEXT NOT NULL,
+  client_name TEXT,
+  client_phone TEXT,
+  items JSONB NOT NULL DEFAULT '[]',
+  subtotal BIGINT NOT NULL DEFAULT 0,
+  tax_amount BIGINT NOT NULL DEFAULT 0,
+  total BIGINT NOT NULL DEFAULT 0,
+  payment_method TEXT NOT NULL,
+  payment_status TEXT NOT NULL DEFAULT 'pending',
+  linked_revenue_id TEXT,
+  is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  payload_json JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices (date);
+CREATE INDEX IF NOT EXISTS idx_invoices_payment_status ON invoices (payment_status);
+CREATE INDEX IF NOT EXISTS idx_invoices_invoice_number ON invoices (invoice_number);
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS tenant_id uuid;
+UPDATE invoices SET tenant_id = '${DEFAULT_TENANT_ID}' WHERE tenant_id IS NULL;
+ALTER TABLE invoices ALTER COLUMN tenant_id SET NOT NULL;
+ALTER TABLE invoices ALTER COLUMN tenant_id SET DEFAULT current_setting('app.tenant_id', true)::uuid;
+CREATE INDEX IF NOT EXISTS idx_invoices_tenant ON invoices (tenant_id);
+ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invoices FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON invoices;
+CREATE POLICY tenant_isolation ON invoices
+  USING (tenant_id = current_setting('app.tenant_id', true)::uuid)
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);
+`,
+  },
+  {
+    id: '008_payment_transactions',
+    label: 'Table de transactions de paiement (Wave / CinetPay / PayDunya)',
+    sql: `
+CREATE TABLE IF NOT EXISTS payment_transactions (
+  id TEXT PRIMARY KEY,
+  reference TEXT NOT NULL UNIQUE,
+  provider TEXT NOT NULL,
+  org_id TEXT NOT NULL,
+  plan_code TEXT,
+  amount_fcfa BIGINT NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  callback_url TEXT,
+  return_url TEXT,
+  metadata JSONB DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  paid_at TEXT,
+  psp_transaction_id TEXT,
+  failure_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_payment_transactions_org ON payment_transactions (org_id);
+CREATE INDEX IF NOT EXISTS idx_payment_transactions_status ON payment_transactions (status);
+CREATE INDEX IF NOT EXISTS idx_payment_transactions_reference ON payment_transactions (reference);
+`,
+  },
 ]
 
 /**

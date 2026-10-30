@@ -58,6 +58,9 @@ function buildPayload(overrides: Partial<SalonBackupPayload> = {}): SalonBackupP
     recurringExpenses: [],
     correctionLogs: [],
     ...overrides,
+    invoices: overrides.invoices ?? [],
+    clients: overrides.clients ?? [],
+    appointments: overrides.appointments ?? [],
   }
 }
 

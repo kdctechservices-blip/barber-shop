@@ -3,15 +3,18 @@ import {
   ArrowUpCircle,
   Award,
   Bell,
+  Calendar,
   ChevronLeft,
   ChevronRight,
   Cloud,
   CloudOff,
+  CreditCard,
   FileBarChart2,
   LayoutDashboard,
   LogOut,
   Menu,
   Moon,
+  Monitor,
   Package,
   Plus,
   Receipt,
@@ -57,6 +60,7 @@ import { useSalonStore } from '../../hooks/salonStoreContext'
 import { useToast } from '../../hooks/toastContext'
 import { formatFCFA } from '../../utils/format'
 import { CommandSearchModal } from './CommandSearchModal'
+import { PWAInstallPrompt } from '../PWAInstallPrompt'
 
 const NAV_GROUPS: Array<{
   heading: string
@@ -77,15 +81,19 @@ const NAV_GROUPS: Array<{
       { to: '/expenses', label: 'Dépenses', icon: ArrowDownCircle },
     ],
   },
-  {
-    heading: 'ACTIVITÉ & ÉQUIPE',
-    items: [
-      { to: '/services', label: 'Prestations et tarifs', icon: Scissors },
-      { to: '/employees', label: 'Personnel', icon: Users },
-      { to: '/payroll', label: 'Salaires et commissions', icon: Award },
-      { to: '/team', label: 'Équipe et abonnement', icon: UsersRound },
-    ],
-  },
+      {
+        heading: 'ACTIVITÉ & ÉQUIPE',
+        items: [
+          { to: '/services', label: 'Prestations et tarifs', icon: Scissors },
+          { to: '/appointments', label: 'Agenda & RDV', icon: Calendar },
+          { to: '/employees', label: 'Personnel', icon: Users },
+          { to: '/payroll', label: 'Salaires et commissions', icon: Award },
+          { to: '/team', label: 'Équipe et abonnement', icon: UsersRound },
+          { to: '/devices', label: 'Appareils connectés', icon: Monitor },
+          { to: '/invoices', label: 'Factures', icon: Receipt },
+          { to: '/billing/payment', label: 'Paiement abonnement', icon: CreditCard },
+        ],
+      },
   {
     heading: 'STOCK & ÉTATS',
     items: [
@@ -864,6 +872,7 @@ export function MainLayout() {
         </header>
 
         <main className="app-content">
+          <PWAInstallPrompt />
           <motion.div
             key={location.pathname}
             variants={pageTransitionVariants}

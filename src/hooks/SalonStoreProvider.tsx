@@ -37,6 +37,9 @@ function createInitialPlaceholderState(): FullSalonState {
     budgets: [],
     recurringExpenses: [],
     correctionLogs: [],
+    clients: [],
+    appointments: [],
+    invoices: [],
   }
 }
 
@@ -52,6 +55,7 @@ export function SalonStoreProvider({
   )
   const [ready, setReady] = useState(false)
   const [mutationCount, setMutationCount] = useState(0)
+  const [dirtyTables, setDirtyTables] = useState<string[]>([])
 
   const refresh = useCallback(async () => {
     const next = await repository.readFullState()
@@ -89,6 +93,7 @@ export function SalonStoreProvider({
       const next = await repository.readFullState()
       setState(next)
       setMutationCount((c) => c + 1)
+      setDirtyTables(repository.getDirtyTables())
       return result
     },
     [repository],
@@ -118,17 +123,24 @@ export function SalonStoreProvider({
     [categoryMap],
   )
 
+  const clearDirtyTables = useCallback(() => {
+    repository.clearDirtyTables()
+    setDirtyTables([])
+  }, [repository])
+
   const value = useMemo(
     () => ({
       state,
       ready,
       mutationCount,
+      dirtyTables,
       categoryLabel,
       refresh,
       mutate,
       syncWithRepo,
+      clearDirtyTables,
     }),
-    [state, ready, mutationCount, categoryLabel, refresh, mutate, syncWithRepo],
+    [state, ready, mutationCount, dirtyTables, categoryLabel, refresh, mutate, syncWithRepo, clearDirtyTables],
   )
 
   return (

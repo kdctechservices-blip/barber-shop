@@ -44,7 +44,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { useAuth } from '../../contexts/authContext'
+import { useAuth, useFieldAuth } from '../../contexts/authContext'
 import { useQuickAction } from '../../contexts/quickActionContext'
 import { useWorkspaceFocus } from '../../contexts/workspaceFocusContext'
 import type {
@@ -121,6 +121,7 @@ export function ServicesPage() {
   const { state, categoryLabel, mutate } = useSalonStore()
   const { currentUser } = useAuth()
   const isManager = currentUser?.role !== 'cashier'
+  const fieldAuth = useFieldAuth({ screen: 'services' })
   const { openCheckoutTicket } = useQuickAction()
   const { focusTarget, clearFocusTarget } = useWorkspaceFocus()
   const toast = useToast()
@@ -1226,6 +1227,7 @@ export function ServicesPage() {
                     placeholder="Ex. 10000"
                     value={referencePrice}
                     onChange={(e) => setReferencePrice(e.target.value)}
+                    disabled={!fieldAuth.canWrite('price')}
                   />
                 </Field>
               </div>
@@ -1277,6 +1279,7 @@ export function ServicesPage() {
                     <Select
                       value={priceLocked ? 'locked' : 'adjustable'}
                       onValueChange={(v) => setPriceLocked(v === 'locked')}
+                      disabled={!fieldAuth.canWrite('price')}
                     >
                       <SelectTrigger id="f-srv-price-policy">
                         <SelectValue />
@@ -1530,6 +1533,7 @@ export function ServicesPage() {
                         onValueChange={(v) =>
                           setCommissionPolicy(v as 'default' | 'rate' | 'fixed')
                         }
+                        disabled={!fieldAuth.canWrite('commissionRate')}
                       >
                         <SelectTrigger id="f-srv-comm-mode">
                           <SelectValue />
@@ -1567,6 +1571,7 @@ export function ServicesPage() {
                           }
                           value={commissionValue}
                           onChange={(e) => setCommissionValue(e.target.value)}
+                          disabled={!fieldAuth.canWrite('commissionRate')}
                         />
                       </Field>
                     )}

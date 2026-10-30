@@ -1,15 +1,18 @@
 import Dexie, { type Table } from 'dexie'
 import type {
   AdvanceEntry,
+  Appointment,
   AppSettings,
   BonusEntry,
   BudgetTarget,
   CashMovement,
   CashSession,
   CategoryItem,
+  Client,
   CorrectionLog,
   Employee,
   ExpenseEntry,
+  Invoice,
   PersistedSyncTombstone,
   ProductItem,
   RecurringExpenseTemplate,
@@ -47,6 +50,9 @@ export class SalonProDatabase extends Dexie {
   users!: Table<SalonUserAccount, string>
   correctionLogs!: Table<CorrectionLog, string>
   syncTombstones!: Table<PersistedSyncTombstone, string>
+  invoices!: Table<Invoice, string>
+  clients!: Table<Client, string>
+  appointments!: Table<Appointment, string>
 
   constructor(dbName = 'SalonProLocalDB') {
     super(dbName)
@@ -140,6 +146,7 @@ export class SalonProDatabase extends Dexie {
         users: 'id, &email, role, isActive, updatedAt',
         correctionLogs: 'id, entityType, entityId, createdAt',
         syncTombstones: 'id, entityType, entityId, deletedAt',
+        invoices: 'id, invoiceNumber, date, paymentStatus, isArchived',
       })
       .upgrade(async (tx) => {
         const nowIso = new Date().toISOString()
@@ -265,6 +272,58 @@ export class SalonProDatabase extends Dexie {
           await tx.table('syncTombstones').bulkPut(tombstones)
         }
       })
+
+    this.version(5).stores({
+      salon: 'id',
+      settings: 'id',
+      categories: 'id, scope, code, isArchived',
+      services: 'id, categoryCode, isActive',
+      employees: 'id, isActive, hireDate',
+      revenues:
+        'id, date, ticketId, receiptNumber, categoryCode, paymentMethod, serviceId, productId, employeeId, isArchived',
+      expenses:
+        'id, date, categoryCode, paymentMethod, sourceModule, recurringTemplateId, recurringPeriodMonth, isArchived',
+      cashSessions: 'id, status, openedAt',
+      cashMovements: 'id, sessionId, type, occurredAt',
+      advances: 'id, employeeId, periodMonth, settledInPayrollId, isArchived',
+      bonuses: 'id, employeeId, periodMonth',
+      salaryPayments: 'id, employeeId, periodMonth, status',
+      products: 'id, sku, categoryCode, isActive',
+      stockMovements: 'id, productId, type, occurredAt',
+      budgets: 'id, periodMonth, kind, categoryCode',
+      recurringExpenses: 'id, categoryCode, isActive',
+      users: 'id, &email, role, isActive, updatedAt',
+      correctionLogs: 'id, entityType, entityId, createdAt',
+      syncTombstones: 'id, entityType, entityId, deletedAt',
+      invoices: 'id, invoiceNumber, date, paymentStatus, isArchived',
+    })
+
+    this.version(6).stores({
+      salon: 'id',
+      settings: 'id',
+      categories: 'id, scope, code, isArchived',
+      services: 'id, categoryCode, isActive',
+      employees: 'id, isActive, hireDate',
+      revenues:
+        'id, date, ticketId, receiptNumber, categoryCode, paymentMethod, serviceId, productId, employeeId, isArchived',
+      expenses:
+        'id, date, categoryCode, paymentMethod, sourceModule, recurringTemplateId, recurringPeriodMonth, isArchived',
+      cashSessions: 'id, status, openedAt',
+      cashMovements: 'id, sessionId, type, occurredAt',
+      advances: 'id, employeeId, periodMonth, settledInPayrollId, isArchived',
+      bonuses: 'id, employeeId, periodMonth',
+      salaryPayments: 'id, employeeId, periodMonth, status',
+      products: 'id, sku, categoryCode, isActive',
+      stockMovements: 'id, productId, type, occurredAt',
+      budgets: 'id, periodMonth, kind, categoryCode',
+      recurringExpenses: 'id, categoryCode, isActive',
+      users: 'id, &email, role, isActive, updatedAt',
+      correctionLogs: 'id, entityType, entityId, createdAt',
+      syncTombstones: 'id, entityType, entityId, deletedAt',
+      invoices: 'id, invoiceNumber, date, paymentStatus, isArchived',
+      clients: 'id, phone, isActive, createdAt, updatedAt',
+      appointments: 'id, clientId, serviceId, employeeId, startAt, status, source',
+    })
   }
 }
 

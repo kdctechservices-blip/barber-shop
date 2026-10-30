@@ -41,6 +41,11 @@ const ServicesPage = lazy(() =>
     default: m.ServicesPage,
   })),
 )
+const AppointmentsPage = lazy(() =>
+  import('../features/appointments/AppointmentsPage').then((m) => ({
+    default: m.AppointmentsPage,
+  })),
+)
 const EmployeesPage = lazy(() =>
   import('../features/employees/EmployeesPage').then((m) => ({
     default: m.EmployeesPage,
@@ -74,6 +79,21 @@ const SettingsPage = lazy(() =>
 const TeamPage = lazy(() =>
   import('../features/team/TeamPage').then((m) => ({
     default: m.TeamPage,
+  })),
+)
+const ConnectedDevicesPage = lazy(() =>
+  import('../features/devices/ConnectedDevicesPage').then((m) => ({
+    default: m.ConnectedDevicesPage,
+  })),
+)
+const InvoicesPage = lazy(() =>
+  import('../features/invoices/InvoicesPage').then((m) => ({
+    default: m.InvoicesPage,
+  })),
+)
+const PaymentPage = lazy(() =>
+  import('../features/billing/PaymentPage').then((m) => ({
+    default: m.PaymentPage,
   })),
 )
 
@@ -146,6 +166,7 @@ export function AppRoutes() {
                     <Route path="revenue" element={<RevenuePage />} />
                     <Route path="expenses" element={<ExpensesPage />} />
                     <Route path="services" element={<ServicesPage />} />
+                    <Route path="appointments" element={<AppointmentsPage />} />
                     <Route
                       path="employees"
                       element={
@@ -192,6 +213,30 @@ export function AppRoutes() {
                       element={
                         <RequireManagerRole>
                           <TeamPage />
+                        </RequireManagerRole>
+                      }
+                    />
+                    <Route
+                      path="devices"
+                      element={
+                        <RequireManagerRole>
+                          <ConnectedDevicesPage />
+                        </RequireManagerRole>
+                      }
+                    />
+                    <Route
+                      path="invoices"
+                      element={
+                        <RequireManagerRole>
+                          <InvoicesPage />
+                        </RequireManagerRole>
+                      }
+                    />
+                    <Route
+                      path="billing/payment"
+                      element={
+                        <RequireManagerRole>
+                          <PaymentPage />
                         </RequireManagerRole>
                       }
                     />

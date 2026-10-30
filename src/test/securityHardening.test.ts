@@ -86,6 +86,9 @@ function buildBasePayload(): SalonBackupPayload {
     budgets: [],
     recurringExpenses: [],
     correctionLogs: [],
+    invoices: [],
+    clients: [],
+    appointments: [],
   }
 }
 

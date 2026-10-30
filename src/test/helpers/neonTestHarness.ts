@@ -53,6 +53,9 @@ const TENANT_SCOPED_TABLES = new Set([
   'budgets',
   'correction_logs',
   'sync_tombstones',
+  'invoices',
+  'clients',
+  'appointments',
 ])
 
 /** Hors RLS : l'authentification précède la connaissance du salon. */
@@ -67,6 +70,7 @@ const GLOBAL_TABLES = [
   'memberships',
   'subscriptions',
   'subscription_events',
+  'payment_transactions',
 ]
 
 const ALL_TABLE_NAMES = [...TENANT_SCOPED_TABLES, ...GLOBAL_TABLES]
