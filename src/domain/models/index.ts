@@ -45,6 +45,7 @@ export interface AppSettings {
   receiptFormat?: ReceiptFormat
   receiptFooterNote?: string
   serviceConfigMode?: ServiceConfigMode
+  freshBarberCatalogSeededAt?: string
   lastBackupExportedAt?: string
   dataHygieneVersion?: number
   mockPurgeCompletedAt?: string
