@@ -62,6 +62,7 @@ import {
   buildDefaultSettings,
   buildSystemCategories,
 } from '../seed'
+import { buildFreshBarberCatalog } from '../freshBarberCatalog'
 import type { IRepository } from './types'
 
 function makeId(prefix: string): string {
@@ -389,6 +390,55 @@ export class SalonRepositoryHub {
    * Initialise la base locale si elle est vierge, et garantit de façon persistante
    * qu'aucune donnée fictive ne subsiste dès lors qu'une base ou un compte réel existe.
    */
+  private async seedFreshBarberCatalogIfNeeded(): Promise<void> {
+    const currentSettings = await this.database.settings.get('default')
+    if (currentSettings?.freshBarberCatalogSeededAt) return
+
+    const nowIso = new Date().toISOString()
+    const catalog = buildFreshBarberCatalog(nowIso)
+    await this.database.transaction(
+      'rw',
+      [this.database.categories, this.database.services, this.database.settings],
+      async () => {
+        const settings = await this.database.settings.get('default')
+        if (settings?.freshBarberCatalogSeededAt) return
+
+        const existingCategories = await this.database.categories.toArray()
+        const categoryCodes = new Set(
+          existingCategories
+            .filter((category) => category.scope === 'service')
+            .map((category) => category.code),
+        )
+        const categoriesToAdd = catalog.categories.filter(
+          (category) => !categoryCodes.has(category.code),
+        )
+        if (categoriesToAdd.length > 0) {
+          await this.database.categories.bulkAdd(categoriesToAdd)
+        }
+
+        const existingServices = await this.database.services.toArray()
+        const existingIds = new Set(existingServices.map((service) => service.id))
+        const existingNames = new Set(
+          existingServices.map((service) => service.name.trim().toLocaleLowerCase('fr')),
+        )
+        const servicesToAdd = catalog.services.filter(
+          (service) =>
+            !existingIds.has(service.id) &&
+            !existingNames.has(service.name.trim().toLocaleLowerCase('fr')),
+        )
+        if (servicesToAdd.length > 0) {
+          await this.database.services.bulkAdd(servicesToAdd)
+        }
+
+        await this.database.settings.put({
+          ...(settings ?? buildDefaultSettings(nowIso)),
+          freshBarberCatalogSeededAt: nowIso,
+          updatedAt: nowIso,
+        })
+      },
+    )
+  }
+
   public async ensureInitialized(_legacySeedFlag?: boolean): Promise<void> {
     void _legacySeedFlag
     const [existingSalon, existingSettings] = await Promise.all([
@@ -401,10 +451,12 @@ export class SalonRepositoryHub {
       ) {
         await this.purgeLegacyMockData()
       }
+      await this.seedFreshBarberCatalogIfNeeded()
       return
     }
 
     const factoryBaselineIso = '1970-01-01T00:00:00.000Z'
+    const catalog = buildFreshBarberCatalog(factoryBaselineIso)
     await this.database.transaction(
       'rw',
       this.database.tables,
@@ -416,10 +468,13 @@ export class SalonRepositoryHub {
         await this.database.settings.put({
           ...buildDefaultSettings(factoryBaselineIso),
           dataHygieneVersion: CURRENT_DATA_HYGIENE_VERSION,
+          freshBarberCatalogSeededAt: factoryBaselineIso,
         })
-        await this.database.categories.bulkPut(
-          buildSystemCategories(factoryBaselineIso),
-        )
+        await this.database.categories.bulkPut([
+          ...buildSystemCategories(factoryBaselineIso),
+          ...catalog.categories,
+        ])
+        await this.database.services.bulkPut(catalog.services)
       },
     )
   }
