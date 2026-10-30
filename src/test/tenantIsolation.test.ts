@@ -3,7 +3,11 @@ import { hashPasswordNode, signAuthSessionToken } from '../../server/authEngine'
 import { resetAllRateLimits } from '../../server/rateLimiter'
 import { DEFAULT_TENANT_ID } from '../../server/tenantContext'
 import type { SalonBackupPayload, SalonUserAccount } from '../domain/models'
-import { createInMemoryNeonPool, invokeApi } from './helpers/neonTestHarness'
+import {
+  createInMemoryNeonPool,
+  invokeApi,
+  seedMembership,
+} from './helpers/neonTestHarness'
 
 /**
  * Isolation multi-salon (audit §6.1 S2 / P0-2).
@@ -85,6 +89,19 @@ function buildPayload(salonName: string, revenueId: string): SalonBackupPayload 
     recurringExpenses: [],
     correctionLogs: [],
   } as unknown as SalonBackupPayload
+}
+
+/** Enregistre l'acteur comme Gérant du salon (les jetons sont forgés ici). */
+async function seedManager(
+  pool: ReturnType<typeof createInMemoryNeonPool>['pool'],
+  tenantId: string,
+  role: 'manager' | 'cashier' = 'manager',
+): Promise<void> {
+  await seedMembership(pool, {
+    tenantId,
+    userId: `usr-${role}-${tenantId.slice(0, 4)}`,
+    role,
+  })
 }
 
 function buildAccount(overrides: Partial<SalonUserAccount> = {}): SalonUserAccount {
@@ -206,6 +223,8 @@ describe('Isolation multi-salon — le tenant ne vient jamais du client', () => 
     const { pool } = createInMemoryNeonPool()
     const tokenA = tokenFor(TENANT_A)
     const tokenB = tokenFor(TENANT_B)
+    await seedManager(pool, TENANT_A)
+    await seedManager(pool, TENANT_B)
 
     const provisionA = await invokeApi({
       method: 'POST',

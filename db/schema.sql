@@ -9,6 +9,7 @@
 -- sur les 19 tables et les politiques RLS tenant_isolation.
 -- La migration 003_sessions y ajoute la table sessions (jetons révocables).
 -- La migration 004_sync_revisions y ajoute sync_state et sync_changes (delta).
+-- La migration 005_memberships y ajoute memberships (rôle et activation par salon).
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS salon_info (

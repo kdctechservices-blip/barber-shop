@@ -654,9 +654,9 @@ Estimations : **j-h**, 1 développeur senior + assistance IA. `P0` = bloquant s�
 
 ---
 
-## 11. Suivi des correctifs — Sprints 1 à 5 (implémentés)
+## 11. Suivi des correctifs — Sprints 1 à 6 (implémentés)
 
-> Mise à jour du 30 octobre 2026, branche `arena/139c7e36-barber-shop`. Sprint 1 : périmètre P0-1 / P0-5 / P0-8 du backlog. Sprint 2 : P0-2 (isolation multi-tenant + RLS) et P0-4 (migrations versionnées). Sprint 3 : S4 (sessions révocables). Sprint 4 : P0-6 (synchronisation delta serveur-autoritaire). Sprint 5 : P0-7 (service worker hors-ligne).
+> Mise à jour du 30 octobre 2026, branche `arena/139c7e36-barber-shop`. Sprint 1 : périmètre P0-1 / P0-5 / P0-8 du backlog. Sprint 2 : P0-2 (isolation multi-tenant + RLS) et P0-4 (migrations versionnées). Sprint 3 : S4 (sessions révocables). Sprint 4 : P0-6 (synchronisation delta serveur-autoritaire). Sprint 5 : P0-7 (service worker hors-ligne). Sprint 6 : P1 (appartenances multi-salons et garde de rôle par entité).
 
 ### 11.1 Vulnérabilités traitées
 
@@ -664,7 +664,7 @@ Estimations : **j-h**, 1 développeur senior + assistance IA. `P0` = bloquant s�
 |---|---|---|
 | **S1** (critique) — escalade via `/api/sync` | ✅ **Corrigée** | `users` retiré de `buildCloudSyncEnvelope`, ignoré côté serveur (`stripUsersFromSyncPayload`), absent des payloads de pull et de la fusion locale. Routes dédiées `/api/users`, `/api/users/provision`, `PATCH /api/users/:id` réservées au Gérant, avec provisionnement en **création seule** (aucun écrasement de rôle ou de hash). |
 | **S2** (critique) — aucun cloisonnement entre salons | ✅ **Corrigée** | `organizations` → `tenants` → données : `tenant_id` sur les 19 tables, RLS activée **et forcée** sur les 18 tables métier (politique `USING` + `WITH CHECK`), contexte posé par transaction (`set_config('app.tenant_id', …, true)`). Le salon provient du jeton signé (`tid`) ou du serveur, jamais de la requête. Voir §11.4. |
-| **S3** (élevée) — aucune autorisation serveur | 🟡 **Partielle** | Autorisation serveur sur toute l'administration des comptes (401 sans session, 403 hors Gérant, rate limit par acteur). Depuis P0-6, les données ne sont plus écrites sous la dictée du client (ordre et contenu validés côté serveur, isolation par salon). Reste : autorisation **par entité métier** (qui peut modifier quoi) et garde de rôle sur les routes métier. |
+| **S3** (élevée) — aucune autorisation serveur | ✅ **Corrigée** | Administration des comptes réservée au Gérant **vérifié en base** (401 sans session, 403 hors Gérant, rate limit par acteur). Depuis P0-6, les données ne sont plus écrites sous la dictée du client. Depuis le sprint 6, une **garde de rôle par entité** filtre les écritures de synchronisation (un Caissier ne touche ni référentiels ni salaires, et ne supprime rien) et la bascule de salon exige une appartenance active. Reste (P2) : politiques par champ et par propriétaire. |
 | **S4** (élevée) — sessions non révocables | ✅ **Corrigée** | Table `sessions` (migration `003_sessions`), jeton d'accès signé de 15 min porteur du claim `sid`, jeton de rafraîchissement opaque haché en base, rotation à usage unique, détection de rejeu révoquant toute la famille, révocation immédiate à la déconnexion. Voir §11.6. |
 | **S5** (élevée) — LWW sur horodatage client | ✅ **Corrigée** | Un client à jour (curseur) ne peut plus figer ni écraser une ligne par une horloge artificielle : le serveur applique les écritures **dans l'ordre d'arrivée** et attribue la révision. Les push « à l'aveugle » (sans curseur) restent filtrés par horodatage pour ne pas écraser de données récentes. Voir §11.7. |
 | **S6** (moyenne) — bruteforce / politique faible | ✅ **Corrigée** | Rate limiting (5/identité + 30/IP sur 15 min, 10 inscriptions/heure), politique 8 caractères lettre + chiffre côté serveur **et** hors-ligne, buckets réinitialisés après une connexion réussie. |
@@ -877,11 +877,49 @@ Jusqu'ici l'application ne s'ouvrait **pas** hors-ligne : aucune ressource n'ét
 - Pas encore d'invite utilisateur « nouvelle version disponible » : le mécanisme existe (`onUpdateReady`), l'UI reste à brancher (P1).
 - Le précache est entièrement re-téléchargé à chaque nouvelle version (pas de cache partiel par fichier) : suffisant à cette taille, à optimiser si l'application grossit.
 
-### 11.10 Reste à faire
 
-1. **P1** — `memberships` multi-salons, garde de rôle sur les routes métier, abonnements et limites de plan.
+### 11.11 Sprint 6 — appartenances multi-salons et garde de rôle (implémenté)
+
+#### Pourquoi
+
+Un compte ne pouvait appartenir qu'à un seul salon, et le rôle porté par le jeton (15 min) restait la seule autorité : un Gérant rétrogradé conservait ses droits jusqu'à expiration, et un Caissier pouvait techniquement pousser n'importe quelle table via la synchronisation.
+
+#### Ce qui est livré
+
+| Élément | Détail |
+|---|---|
+| Table `memberships` (migration `005_memberships`) | `(tenant_id, user_id, role, is_active)`, clé primaire composite, backfill automatique des comptes existants |
+| Séparation identité / appartenance | `salon_users` reste le porteur des identifiants et du hash ; `memberships` porte le **rôle et l'activation par salon** |
+| `GET /api/auth/tenants` | Liste les salons du compte avec le rôle réel dans chacun + salon actif |
+| `POST /api/auth/switch-tenant` | Bascule de salon : appartenance active vérifiée en base, rôle du nouveau jeton issu de l'appartenance, **ancienne session révoquée** |
+| Autorité en base | Les routes d'administration vérifient le rôle dans `memberships` à chaque appel : une rétrogradation prend effet immédiatement (403 `MANAGER_ROLE_REQUIRED`) |
+| Révocation sur changement | Rôle ou activation modifiés → toutes les sessions du compte sont révoquées (`role_changed`) |
+| Garde de rôle par entité | `server/permissions.ts` : un Caissier n'écrit que `revenues`, `expenses`, `cash_sessions`, `cash_movements`, `stock_movements` et ne supprime rien. Le reste (salon, réglages, référentiels, budgets, salaires, avances, corrections) est réservé au Gérant |
+| Refus traçables | La réponse de synchronisation contient `rejected` (`WRITE_FORBIDDEN_FOR_ROLE`, `DELETE_FORBIDDEN_FOR_ROLE`) et `stats.rejectedRecords` |
+| Synchronisation machine | Un push authentifié par le secret serveur seul (sans rôle utilisateur) n'est pas filtré : ce chemin reste réservé aux scripts et à la compatibilité PIN |
+
+#### Validation
+
+| Commande | Résultat |
+|---|---|
+| `npm run lint` | 0 erreur, 0 avertissement (122 fichiers) |
+| `npm test` | **101/101** tests verts (18 fichiers) |
+| `npm run build` | OK |
+
+`src/test/membershipsAndRoles.test.ts` (8 tests) couvre : création et liste des appartenances, bascule de salon avec changement de rôle et révocation de l'ancienne session, refus d'un salon non autorisé / d'une cible invalide / d'un appel anonyme, rétrogradation prise en compte immédiatement (vérification en base), refus d'écriture d'employé et de réglages pour un Caissier, refus de suppression, autorisations complètes du Gérant, non-filtrage du canal machine, et politique de droits documentée.
+
+#### Limites assumées
+
+- `listUsersOnNeon` liste encore les comptes dont le salon « d'origine » est le salon courant (`salon_users.tenant_id`) et non l'ensemble des membres : la jointure `memberships` est à faire avec l'écran « Équipe » (P1).
+- Pas encore d'interface de bascule de salon dans l'application (les routes existent et sont testées) ; l'écran de sélection fait partie du sprint suivant.
+- Politique de droits volontairement simple (rôle → tables) : pas de contrôle par champ ni par propriétaire de l'enregistrement.
+
+### 11.12 Reste à faire
+
+1. **P1** — écran « Équipe » basé sur `memberships` + sélecteur de salon, abonnements et limites de plan.
 2. **P1** — maintenance : purge des sessions expirées et du journal `sync_changes`, écran « appareils connectés », invite de mise à jour PWA.
-3. **P2** — dirty tracking côté client (payloads réduits), notifications WhatsApp/SMS, CRM/fidélité.
+3. **P2** — dirty tracking côté client, politiques de droits par champ, notifications WhatsApp/SMS, CRM/fidélité.
+
 
 
 

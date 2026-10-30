@@ -3,11 +3,13 @@ import {
   AuthApiError,
   getNeonAuthStatus,
   listUsersOnNeon,
+  listUserTenants,
   loginUserOnNeon,
   logoutUserSession,
   provisionUsersOnNeon,
   refreshUserSession,
   registerUserOnNeon,
+  switchTenantSession,
   updateUserOnNeon,
   verifyAuthSessionToken,
   type RegisterUserInput,
@@ -444,6 +446,50 @@ export async function handleSalonApiRequest(
       return true
     }
 
+
+    if (pathname === '/api/auth/tenants' && req.method === 'GET') {
+      try {
+        const tenants = await listUserTenants(pool, callerSession)
+        sendJson(res, 200, {
+          ok: true,
+          activeTenantId: callerSession?.tid ?? null,
+          tenants,
+        })
+      } catch (err) {
+        const formatted = formatDbError(err)
+        sendJson(res, formatted.status, {
+          ok: false,
+          code: formatted.code,
+          message: formatted.message,
+        })
+      }
+      return true
+    }
+
+    if (pathname === '/api/auth/switch-tenant' && req.method === 'POST') {
+      try {
+        const body = (await readJsonBody(req)) as { tenantId?: string }
+        const result = await switchTenantSession(
+          pool,
+          callerSession,
+          String(body.tenantId ?? '').trim(),
+          { expectedPin, metadata: sessionMetadata },
+        )
+        console.info(
+          `[audit] tenant.switch actor=${callerSession?.uid} from=${callerSession?.tid} to=${result.tenantId}`,
+        )
+        sendJson(res, 200, { ok: true, ...result })
+      } catch (err) {
+        const formatted = formatDbError(err)
+        sendJson(res, formatted.status, {
+          ok: false,
+          code: formatted.code,
+          message: formatted.message,
+        })
+      }
+      return true
+    }
+
     sendJson(res, 404, {
       ok: false,
       code: 'NOT_FOUND',
@@ -686,7 +732,7 @@ export async function handleSalonApiRequest(
           tombstones: Array.isArray(body.tombstones) ? body.tombstones : [],
         },
         tenantId,
-        { cursor: body.cursor },
+        { cursor: body.cursor, role: callerSession?.role },
       )
       sendJson(res, 200, result as unknown as Record<string, unknown>)
     } catch (err) {

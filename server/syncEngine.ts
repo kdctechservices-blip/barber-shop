@@ -29,6 +29,8 @@ import {
 import type { SqlPoolLike, SqlQueryable } from './neonClient.ts'
 import { runMigrations } from './migrations.ts'
 import { isTenantId, setTenantContext } from './tenantContext.ts'
+import { canDeleteEntity, canWriteTable } from './permissions.ts'
+import type { UserRole } from '../src/domain/models/index.ts'
 
 export type { SyncTombstoneEntityType }
 
@@ -70,7 +72,11 @@ export interface CloudSyncResult {
     pushedRecords: number
     totalRemoteRecords: number
     tombstonesApplied: number
+    /** Lignes ou suppressions refusées faute de droits (garde de rôle). */
+    rejectedRecords?: number
   }
+  /** Détail des refus : utile au client pour signaler l'action non autorisée. */
+  rejected?: Array<{ table: string; id: string; reason: string }>
   /** État complet — renvoyé uniquement aux clients qui ne fournissent pas de curseur. */
   payload?: SalonBackupPayload
   /** Tombstones connus — idem. */
@@ -431,6 +437,48 @@ function indexRows(
 }
 
 
+
+/**
+ * Retire du payload les tables qu'un acteur n'a pas le droit d'écrire.
+ * Le filtrage se fait **avant** l'écriture : la ligne refusée n'est jamais
+ * appliquée, et le client reçoit le détail du refus.
+ */
+function filterForbiddenPayload(
+  payload: SalonBackupPayload,
+  role: UserRole | undefined,
+  rejected: Array<{ table: string; id: string; reason: string }>,
+): SalonBackupPayload {
+  if (!role || role === 'manager') return payload
+  const filtered: SalonBackupPayload = { ...payload }
+
+  for (const { table, key, single } of DELTA_TABLES) {
+    if (canWriteTable(role, table)) continue
+    if (single) {
+      const row = payload[key] as { id?: string } | undefined
+      if (row) {
+        rejected.push({
+          table,
+          id: String(row.id ?? ''),
+          reason: 'WRITE_FORBIDDEN_FOR_ROLE',
+        })
+      }
+      ;(filtered as unknown as Record<string, unknown>)[key] = undefined
+      continue
+    }
+    const rows = (payload[key] as Array<{ id?: string }> | undefined) ?? []
+    for (const row of rows) {
+      rejected.push({
+        table,
+        id: String(row.id ?? ''),
+        reason: 'WRITE_FORBIDDEN_FOR_ROLE',
+      })
+    }
+    ;(filtered as unknown as Record<string, unknown>)[key] = []
+  }
+
+  return filtered
+}
+
 /**
  * Filtre les lignes « périmées » d'un push complet (sans curseur).
  *
@@ -681,7 +729,7 @@ export async function syncWithNeonDatabase(
   pool: SqlPoolLike,
   incoming: CloudSyncEnvelope,
   tenantId: string,
-  options?: { cursor?: string | number },
+  options?: { cursor?: string | number; role?: UserRole },
 ): Promise<CloudSyncResult> {
   if (!isTenantId(tenantId)) {
     throw new Error('Synchronisation refusée : contexte de salon invalide.')
@@ -710,13 +758,28 @@ export async function syncWithNeonDatabase(
       )
     }
 
+    // Garde de rôle par entité : un Caissier ne peut pas modifier la
+    // configuration du salon, les référentiels, les budgets ni les salaires,
+    // et ne peut rien supprimer (audit S3).
+    const rejected: Array<{ table: string; id: string; reason: string }> = []
+    const allowedPayload = filterForbiddenPayload(rawPayload, options?.role, rejected)
+    const allowedTombstones = (incoming.tombstones ?? []).filter((tb) => {
+      if (canDeleteEntity(options?.role, tb.entityType)) return true
+      rejected.push({
+        table: TOMBSTONE_TABLE_MAP[tb.entityType]?.table ?? 'sync_tombstones',
+        id: tb.entityId,
+        reason: 'DELETE_FORBIDDEN_FOR_ROLE',
+      })
+      return false
+    })
+
     const cursorProvidedEarly =
       options?.cursor !== undefined && options?.cursor !== null
     // Push « à l'aveugle » (sans curseur) : les lignes plus anciennes que l'état
     // serveur sont écartées pour ne pas écraser des données récentes.
     const p = cursorProvidedEarly
-      ? rawPayload
-      : dropStaleRows(rawPayload, before.payload)
+      ? allowedPayload
+      : dropStaleRows(allowedPayload, before.payload)
 
     // 1. SalonInfo (nettoyé de toute valeur fictive héritée)
     if (p.salon) {
@@ -1196,7 +1259,7 @@ export async function syncWithNeonDatabase(
     }
 
     // 13. Tombstones de suppressions définitives (budgets, modèles récurrents, prestations non utilisées)
-    for (const tb of incoming.tombstones ?? []) {
+    for (const tb of allowedTombstones) {
       await client.query(
         `INSERT INTO sync_tombstones (entity_type, entity_id, deleted_at)
          VALUES ($1, $2, $3)
@@ -1248,7 +1311,9 @@ export async function syncWithNeonDatabase(
         pushedRecords,
         totalRemoteRecords: merged.totalRemoteRecords,
         tombstonesApplied,
+        rejectedRecords: rejected.length,
       },
+      ...(rejected.length > 0 ? { rejected } : {}),
       cursor: delta.cursor,
       changes: delta.changes,
       deleted: delta.deleted,

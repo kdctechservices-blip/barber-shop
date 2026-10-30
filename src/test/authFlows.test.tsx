@@ -90,6 +90,12 @@ function createAuthMemoryPool(): SqlPoolLike {
       })
       return { rows: [], rowCount: 1 }
     }
+    if (norm.startsWith('INSERT INTO memberships')) {
+      return { rows: [], rowCount: 1 }
+    }
+    if (norm.includes('FROM memberships')) {
+      return { rows: [], rowCount: 0 }
+    }
     if (norm.startsWith('INSERT INTO sessions')) {
       const columns = norm
         .slice(

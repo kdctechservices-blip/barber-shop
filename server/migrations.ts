@@ -191,6 +191,43 @@ CREATE POLICY tenant_isolation ON sync_changes
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);
 `
 
+
+/**
+ * Appartenances multi-salons (P1).
+ *
+ * Un compte peut travailler dans plusieurs salons, avec un rôle et une
+ * activation propres à chacun. La table est alimentée par le backfill des
+ * comptes existants, puis maintenue par les routes d'administration.
+ *
+ * Hors RLS comme `salon_users` : elle est lue avant la résolution du salon
+ * actif (liste des salons d'un compte) et pour vérifier les droits d'un acteur.
+ */
+export const MEMBERSHIPS_SQL = `
+CREATE TABLE IF NOT EXISTS memberships (
+  tenant_id uuid NOT NULL,
+  user_id text NOT NULL,
+  role text NOT NULL,
+  is_active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships (user_id);
+
+-- Backfill : chaque compte existant devient membre de son salon.
+INSERT INTO memberships (tenant_id, user_id, role, is_active, created_at, updated_at)
+SELECT tenant_id,
+       id,
+       role,
+       is_active,
+       NULLIF(created_at, '')::timestamptz,
+       NULLIF(updated_at, '')::timestamptz
+  FROM salon_users
+ WHERE tenant_id IS NOT NULL
+ON CONFLICT (tenant_id, user_id) DO NOTHING;
+`
+
 export const MIGRATIONS: Migration[] = [
   {
     id: '001_baseline',
@@ -211,6 +248,11 @@ export const MIGRATIONS: Migration[] = [
     id: '004_sync_revisions',
     label: 'Journal de synchronisation delta et révisions serveur',
     sql: SYNC_REVISIONS_SQL,
+  },
+  {
+    id: '005_memberships',
+    label: 'Appartenances multi-salons (rôle et activation par salon)',
+    sql: MEMBERSHIPS_SQL,
   },
 ]
 

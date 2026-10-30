@@ -5,11 +5,16 @@ import {
   verifyPasswordNode,
 } from '../../server/authEngine'
 import { resetAllRateLimits } from '../../server/rateLimiter'
+import { DEFAULT_TENANT_ID } from '../../server/tenantContext'
 import { stripUsersFromSyncPayload } from '../../server/syncEngine'
 import type { SalonBackupPayload, SalonUserAccount } from '../domain/models'
 import { SalonProDatabase } from '../db/database'
 import { SalonRepositoryHub } from '../db/repositories/salonRepositories'
-import { createInMemoryNeonPool, invokeApi } from './helpers/neonTestHarness'
+import {
+  createInMemoryNeonPool,
+  invokeApi,
+  seedMembership,
+} from './helpers/neonTestHarness'
 
 const TEST_PIN = 'test-sync-secret'
 const MANAGER = { id: 'usr-manager-001', email: 'gerant@salon.ci', role: 'manager' as const }
@@ -91,6 +96,11 @@ describe('Sécurité — escalade de privilèges impossible via la synchronisati
 
   it('ignore tout compte injecté dans un payload de synchronisation et ne le renvoie jamais', async () => {
     const { pool, tables } = createInMemoryNeonPool()
+    await seedMembership(pool, {
+      tenantId: DEFAULT_TENANT_ID,
+      userId: MANAGER.id,
+      role: 'manager',
+    })
     const payload = buildBasePayload()
     const forgedManager = buildAccount({
       id: 'usr-evil-001',
@@ -172,6 +182,11 @@ describe('Sécurité — administration des comptes réservée au Gérant', () =
 
   it('refuse /api/users sans session, puis refuse un Caissier', async () => {
     const { pool } = createInMemoryNeonPool()
+    await seedMembership(pool, {
+      tenantId: DEFAULT_TENANT_ID,
+      userId: MANAGER.id,
+      role: 'manager',
+    })
 
     const anonymous = await invokeApi({
       method: 'GET',
@@ -205,6 +220,11 @@ describe('Sécurité — administration des comptes réservée au Gérant', () =
 
   it('provisionne un compte hors-ligne, puis refuse toute réécriture de rôle ou de hash', async () => {
     const { pool, tables } = createInMemoryNeonPool()
+    await seedMembership(pool, {
+      tenantId: DEFAULT_TENANT_ID,
+      userId: MANAGER.id,
+      role: 'manager',
+    })
     const account = buildAccount()
 
     const first = await invokeApi({
@@ -250,6 +270,11 @@ describe('Sécurité — administration des comptes réservée au Gérant', () =
 
   it('rejette les comptes structurellement invalides (hash falsifié, rôle inconnu)', async () => {
     const { pool, tables } = createInMemoryNeonPool()
+    await seedMembership(pool, {
+      tenantId: DEFAULT_TENANT_ID,
+      userId: MANAGER.id,
+      role: 'manager',
+    })
     const res = await invokeApi({
       method: 'POST',
       url: '/api/users/provision',
@@ -270,6 +295,11 @@ describe('Sécurité — administration des comptes réservée au Gérant', () =
 
   it('liste les comptes sans jamais exposer les hashes de mots de passe', async () => {
     const { pool } = createInMemoryNeonPool()
+    await seedMembership(pool, {
+      tenantId: DEFAULT_TENANT_ID,
+      userId: MANAGER.id,
+      role: 'manager',
+    })
     await invokeApi({
       method: 'POST',
       url: '/api/users/provision',
@@ -296,6 +326,11 @@ describe('Sécurité — administration des comptes réservée au Gérant', () =
 
   it('protège le dernier Gérant actif et hache côté serveur tout nouveau mot de passe', async () => {
     const { pool, tables } = createInMemoryNeonPool()
+    await seedMembership(pool, {
+      tenantId: DEFAULT_TENANT_ID,
+      userId: MANAGER.id,
+      role: 'manager',
+    })
     const manager = buildAccount({
       id: 'usr-manager-777',
       email: 'bigboss@salon.ci',
@@ -373,6 +408,11 @@ describe('Sécurité — authentification et politique de mot de passe', () => {
 
   it('applique la politique de mot de passe à l’inscription', async () => {
     const { pool } = createInMemoryNeonPool()
+    await seedMembership(pool, {
+      tenantId: DEFAULT_TENANT_ID,
+      userId: MANAGER.id,
+      role: 'manager',
+    })
 
     const tooShort = await invokeApi({
       method: 'POST',
@@ -419,6 +459,11 @@ describe('Sécurité — authentification et politique de mot de passe', () => {
 
   it('bloque le bruteforce après 5 tentatives et libère le compteur après succès', async () => {
     const { pool } = createInMemoryNeonPool()
+    await seedMembership(pool, {
+      tenantId: DEFAULT_TENANT_ID,
+      userId: MANAGER.id,
+      role: 'manager',
+    })
     const account = buildAccount({
       id: 'usr-login-001',
       email: 'login@salon.ci',

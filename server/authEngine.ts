@@ -25,6 +25,13 @@ import {
   withTenantClient,
 } from './tenantContext.ts'
 import {
+  isActiveManagerOfTenant,
+  listMembershipsForUser,
+  readMembership,
+  upsertMembership,
+  type Membership,
+} from './memberships.ts'
+import {
   ACCESS_TOKEN_TTL_MS,
   createSession,
   findSessionByRefreshToken,
@@ -464,6 +471,17 @@ export async function registerUserOnNeon(
       ],
     )
 
+    // Appartenance au salon : le rôle et l'activation vivent désormais ici
+    // (source de vérité des droits), `salon_users` restant le porteur des
+    // identifiants.
+    await upsertMembership(client, {
+      tenantId,
+      userId: account.id,
+      role: account.role,
+      isActive: account.isActive,
+      now: account.updatedAt,
+    })
+
     // Purge persistante immédiate de toute donnée mock éventuelle pour ce salon.
     await readFullCloudState(client, tenantId)
   })
@@ -762,6 +780,131 @@ export async function logoutUserSession(
   return { revoked }
 }
 
+
+/* -------------------------------------------------------------------------- */
+/* Multi-salon : salons d'un compte et bascule de salon actif (P1)             */
+/* -------------------------------------------------------------------------- */
+
+export interface UserTenantSummary {
+  tenantId: string
+  name: string
+  slug: string | null
+  role: UserRole
+  isActive: boolean
+}
+
+/**
+ * Salons auxquels le compte appartient, avec le rôle réel dans chacun.
+ * Lecture globale assumée (comme l'authentification) : elle porte uniquement
+ * sur les appartenances du **compte authentifié**.
+ */
+export async function listUserTenants(
+  pool: SqlPoolLike,
+  actor: SessionTokenPayload | null | undefined,
+): Promise<UserTenantSummary[]> {
+  if (!actor) {
+    throw new AuthApiError(
+      401,
+      'SESSION_REQUIRED',
+      'Authentification requise pour lister vos salons.',
+    )
+  }
+  await ensureNeonSchema(pool)
+
+  const memberships: Membership[] = await listMembershipsForUser(pool, actor.uid)
+  const tenantsRes = await pool.query<{ id: string; name: string; slug: string }>(
+    'SELECT id, name, slug FROM tenants ORDER BY name ASC',
+  )
+  const tenantById = new Map(tenantsRes.rows.map((row) => [row.id, row]))
+
+  return memberships.map((membership) => ({
+    tenantId: membership.tenantId,
+    name: tenantById.get(membership.tenantId)?.name ?? 'Salon',
+    slug: tenantById.get(membership.tenantId)?.slug ?? null,
+    role: membership.role,
+    isActive: membership.isActive,
+  }))
+}
+
+/**
+ * Bascule la session vers un autre salon du même compte.
+ *
+ * - l'appartenance est vérifiée **en base** (rôle et activation du salon cible) ;
+ * - le rôle du nouveau jeton est celui de l'appartenance, pas celui de l'ancien salon ;
+ * - l'ancienne session est révoquée (rotation), pour ne pas laisser deux
+ *   sessions actives pointant sur des salons différents.
+ */
+export async function switchTenantSession(
+  pool: SqlPoolLike,
+  actor: SessionTokenPayload | null | undefined,
+  tenantId: string,
+  options?: { expectedPin?: string; metadata?: SessionMetadata },
+): Promise<
+  {
+    user: PublicSalonUser
+    recordForCache: SalonUserAccount
+    tenantId: string
+  } & IssuedAuthSession
+> {
+  if (!actor) {
+    throw new AuthApiError(
+      401,
+      'SESSION_REQUIRED',
+      'Authentification requise pour changer de salon.',
+    )
+  }
+  if (!isTenantId(tenantId)) {
+    throw new AuthApiError(400, 'INVALID_TENANT', 'Salon cible invalide.')
+  }
+  await ensureNeonSchema(pool)
+
+  const membership = await readMembership(pool, tenantId, actor.uid)
+  if (!membership || !membership.isActive) {
+    throw new AuthApiError(
+      403,
+      'TENANT_ACCESS_DENIED',
+      "Vous n'avez pas accès à ce salon.",
+    )
+  }
+
+  // L'identité et les identifiants sont **globaux** (`salon_users`) ; ce sont
+  // les appartenances qui portent le rôle propre à chaque salon.
+  const globalAccounts = await readAccountsGlobal(pool)
+  const account = globalAccounts.find((entry) => entry.account.id === actor.uid)
+    ?.account
+  if (!account) {
+    throw new AuthApiError(
+      403,
+      'TENANT_ACCESS_DENIED',
+      "Compte introuvable : reconnectez-vous.",
+    )
+  }
+  if (!account.isActive) {
+    throw new AuthApiError(
+      403,
+      'ACCOUNT_DISABLED',
+      'Ce compte a été désactivé par le Gérant.',
+    )
+  }
+
+  const effectiveAccount: SalonUserAccount = {
+    ...account,
+    role: membership.role,
+    tenantId,
+  }
+
+  if (actor.sid) {
+    await revokeSessionById(pool, actor.sid, 'tenant_switch')
+  }
+
+  return {
+    user: toPublicUser(effectiveAccount),
+    recordForCache: effectiveAccount,
+    tenantId,
+    ...(await issueAuthSession(pool, effectiveAccount, tenantId, options)),
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /* Administration des comptes — réservée au Gérant (jamais via la synchro)     */
 /* -------------------------------------------------------------------------- */
@@ -784,6 +927,26 @@ function assertManagerActor(actor: SessionTokenPayload | null | undefined): void
       403,
       'MANAGER_ROLE_REQUIRED',
       'Seul un compte Gérant peut administrer les comptes du salon.',
+    )
+  }
+}
+
+/**
+ * Vérifie dans la base que l'acteur est **toujours** Gérant actif du salon.
+ * Le jeton porte un rôle figé au moment de la connexion : cette vérification
+ * ferme la fenêtre où un Gérant rétrogradé conserverait ses droits.
+ */
+async function assertManagerMembership(
+  pool: SqlPoolLike,
+  tenantId: string,
+  actor: SessionTokenPayload,
+): Promise<void> {
+  const allowed = await isActiveManagerOfTenant(pool, tenantId, actor.uid)
+  if (!allowed) {
+    throw new AuthApiError(
+      403,
+      'MANAGER_ROLE_REQUIRED',
+      "Vos droits de Gérant sur ce salon ne sont plus valides : reconnectez-vous.",
     )
   }
 }
@@ -832,6 +995,7 @@ export async function provisionUsersOnNeon(
 ): Promise<UserProvisioningResult> {
   const tenantId = assertTenantActor(actor)
   await ensureNeonSchema(pool)
+  if (actor) await assertManagerMembership(pool, tenantId, actor)
 
   const rawAccounts = Array.isArray(input.accounts) ? input.accounts : []
   let created = 0
@@ -923,6 +1087,13 @@ export async function provisionUsersOnNeon(
             tenantId,
           ],
         )
+        await upsertMembership(client, {
+          tenantId,
+          userId: account.id,
+          role: account.role,
+          isActive: account.isActive,
+          now: account.updatedAt,
+        })
       })
       created += 1
       existingIds.add(account.id)
@@ -942,6 +1113,7 @@ export async function listUsersOnNeon(
 ): Promise<PublicSalonUser[]> {
   const tenantId = assertTenantActor(actor)
   await ensureNeonSchema(pool)
+  if (actor) await assertManagerMembership(pool, tenantId, actor)
   const accounts = await withTenantClient(pool, tenantId, (client) =>
     readAccountsForTenant(client, tenantId),
   )
@@ -968,6 +1140,7 @@ export async function updateUserOnNeon(
 ): Promise<PublicSalonUser> {
   const tenantId = assertTenantActor(actor)
   await ensureNeonSchema(pool)
+  if (actor) await assertManagerMembership(pool, tenantId, actor)
 
   const accounts = await withTenantClient(pool, tenantId, (client) =>
     readAccountsForTenant(client, tenantId),
@@ -1078,7 +1251,21 @@ export async function updateUserOnNeon(
         tenantId,
       ],
     )
+
+    await upsertMembership(client, {
+      tenantId,
+      userId: updated.id,
+      role: updated.role,
+      isActive: updated.isActive,
+      now: updated.updatedAt,
+    })
   })
+
+  // Un changement de rôle ou une désactivation coupe immédiatement les sessions
+  // ouvertes du compte concerné (le jeton ne survit pas à la décision).
+  if (nextRole !== target.role || nextIsActive !== target.isActive) {
+    await revokeAllSessionsForUser(pool, tenantId, updated.id, 'role_changed')
+  }
 
   return toPublicUser(updated)
 }

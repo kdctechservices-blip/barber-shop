@@ -64,6 +64,7 @@ const GLOBAL_TABLES = [
   'schema_migrations',
   'sync_state',
   'sync_changes',
+  'memberships',
 ]
 
 const ALL_TABLE_NAMES = [...TENANT_SCOPED_TABLES, ...GLOBAL_TABLES]
@@ -243,6 +244,43 @@ export function createInMemoryNeonPool(options?: { failNetwork?: boolean }): {
         rowCount += 1
       }
       return { rows: [], rowCount }
+    }
+
+    // Appartenances multi-salons (P1)
+    if (/^SELECT .+ FROM memberships/i.test(normalized)) {
+      const match = normalized.match(
+        /^SELECT (.+?) FROM memberships(?: WHERE (.+?))?(?: ORDER BY .*)?$/i,
+      )
+      if (!match) throw new Error(`Requête memberships non gérée : ${normalized}`)
+      const columns = match[1].split(',').map((column) => column.trim())
+      const conditions = match[2] ? parseConditions(match[2], values) : []
+      const rows = Array.from(tables.get('memberships')!.values())
+        .filter((row) => matchesConditions(row, conditions))
+        .map((row) => {
+          const projected: Record<string, unknown> = {}
+          for (const column of columns) {
+            projected[column] = (row as unknown as Record<string, unknown>)[
+              column
+            ]
+          }
+          return projected as R
+        })
+      return { rows, rowCount: rows.length }
+    }
+
+    if (/^DELETE FROM memberships/i.test(normalized)) {
+      const key = `${String(values[0])}:${String(values[1])}`
+      const existed = tables.get('memberships')!.delete(key)
+      return { rows: [], rowCount: existed ? 1 : 0 }
+    }
+
+    if (/^SELECT id, name, slug FROM tenants/i.test(normalized)) {
+      const rows = Array.from(tables.get('tenants')!.values()).map((row) => ({
+        id: row.id,
+        name: (row as unknown as Record<string, unknown>).name ?? 'Salon',
+        slug: (row as unknown as Record<string, unknown>).slug ?? null,
+      })) as R[]
+      return { rows, rowCount: rows.length }
     }
 
     // Journal de synchronisation delta (P0-6)
@@ -448,6 +486,7 @@ export function createInMemoryNeonPool(options?: { failNetwork?: boolean }): {
       // identique (équivalent de `payload_json IS DISTINCT FROM EXCLUDED.payload_json`).
       if (
         existing &&
+        payloadIdx >= 0 &&
         JSON.stringify(existing.payload_json) === JSON.stringify(parsedPayload)
       ) {
         return { rows: [], rowCount: 0 }
@@ -474,6 +513,37 @@ export function createInMemoryNeonPool(options?: { failNetwork?: boolean }): {
   }
 
   return { pool, tables }
+}
+
+/**
+ * Crée l'appartenance d'un acteur à un salon — étape de préparation des tests
+ * qui forgent un jeton (les tests de parcours réels passent par l'inscription).
+ */
+export async function seedMembership(
+  pool: SqlPoolLike,
+  params: {
+    tenantId: string
+    userId: string
+    role?: 'manager' | 'cashier'
+    isActive?: boolean
+  },
+): Promise<void> {
+  const now = new Date().toISOString()
+  await pool.query(
+    `INSERT INTO memberships (tenant_id, user_id, role, is_active, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $5)
+     ON CONFLICT (tenant_id, user_id) DO UPDATE SET
+       role = EXCLUDED.role,
+       is_active = EXCLUDED.is_active,
+       updated_at = EXCLUDED.updated_at`,
+    [
+      params.tenantId,
+      params.userId,
+      params.role ?? 'manager',
+      params.isActive !== false,
+      now,
+    ],
+  )
 }
 
 export async function invokeApi(params: {
