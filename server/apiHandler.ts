@@ -2,11 +2,23 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
   AuthApiError,
   getNeonAuthStatus,
+  listUsersOnNeon,
   loginUserOnNeon,
+  provisionUsersOnNeon,
   registerUserOnNeon,
+  updateUserOnNeon,
   verifyAuthSessionToken,
   type RegisterUserInput,
+  type SessionTokenPayload,
+  type UpdateUserInput,
 } from './authEngine.ts'
+import {
+  checkRateLimit,
+  consumeRateLimit,
+  RATE_LIMITS,
+  recordRateLimitFailure,
+  resetRateLimit,
+} from './rateLimiter.ts'
 import {
   getNeonPool,
   sanitizeDatabaseUrl,
@@ -34,6 +46,7 @@ function sendJson(
   res.statusCode = statusCode
   res.setHeader('Content-Type', 'application/json; charset=utf-8')
   res.setHeader('Cache-Control', 'no-store')
+  res.setHeader('X-Content-Type-Options', 'nosniff')
   res.end(JSON.stringify(body))
 }
 
@@ -51,6 +64,36 @@ function extractPinFromHeaders(req: IncomingMessage): string | undefined {
     return pinHeader.trim()
   }
   return extractBearerToken(req)
+}
+
+function extractClientIp(req: IncomingMessage): string {
+  const forwarded = req.headers['x-forwarded-for']
+  const raw = Array.isArray(forwarded) ? forwarded[0] : forwarded
+  if (typeof raw === 'string' && raw.trim()) {
+    return raw.split(',')[0].trim()
+  }
+  const realIp = req.headers['x-real-ip']
+  if (typeof realIp === 'string' && realIp.trim()) {
+    return realIp.trim()
+  }
+  const socket = req.socket as { remoteAddress?: string } | undefined
+  return socket?.remoteAddress ?? 'unknown'
+}
+
+function rejectWhenRateLimited(
+  res: ServerResponse,
+  result: { allowed: boolean; retryAfterSeconds: number },
+  message: string,
+): boolean {
+  if (result.allowed) return false
+  res.setHeader('Retry-After', String(Math.max(1, result.retryAfterSeconds)))
+  sendJson(res, 429, {
+    ok: false,
+    code: 'TOO_MANY_ATTEMPTS',
+    message,
+    retryAfterSeconds: Math.max(1, result.retryAfterSeconds),
+  })
+  return true
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -166,10 +209,22 @@ export async function handleSalonApiRequest(
       ? options.poolOverride
       : getNeonPool(dbUrl)
 
-  const callerSession = verifyAuthSessionToken(
-    extractBearerToken(req),
-    expectedPin,
-  )
+  let callerSession: SessionTokenPayload | null = null
+  try {
+    callerSession = verifyAuthSessionToken(
+      extractBearerToken(req),
+      expectedPin,
+    )
+  } catch (err) {
+    const formatted = formatDbError(err)
+    sendJson(res, formatted.status, {
+      ok: false,
+      code: formatted.code,
+      message: formatted.message,
+    })
+    return true
+  }
+  const clientIp = extractClientIp(req)
 
   // 2. Routes publiques d'authentification (/api/auth/*)
   if (pathname.startsWith('/api/auth/')) {
@@ -203,6 +258,19 @@ export async function handleSalonApiRequest(
 
     if (pathname === '/api/auth/register' && req.method === 'POST') {
       try {
+        const registerLimit = consumeRateLimit(
+          `register:${clientIp}`,
+          RATE_LIMITS.registerPerIp,
+        )
+        if (
+          rejectWhenRateLimited(
+            res,
+            registerLimit,
+            "Trop de créations de compte depuis cet appareil. Réessayez dans quelques minutes.",
+          )
+        ) {
+          return true
+        }
         const body = (await readJsonBody(req)) as RegisterUserInput
         const result = await registerUserOnNeon(pool, body, {
           expectedPin,
@@ -229,11 +297,44 @@ export async function handleSalonApiRequest(
           email?: string
           password?: string
         }
-        const result = await loginUserOnNeon(
-          pool,
-          { email: body.email ?? '', password: body.password ?? '' },
-          { expectedPin },
+        const identityKey = `login:${clientIp}:${String(body.email ?? '')
+          .trim()
+          .toLowerCase()}`
+        const ipKey = `login-ip:${clientIp}`
+        const identityState = checkRateLimit(
+          identityKey,
+          RATE_LIMITS.loginPerIdentity,
         )
+        const ipState = checkRateLimit(ipKey, RATE_LIMITS.loginPerIp)
+        if (
+          rejectWhenRateLimited(
+            res,
+            identityState,
+            'Trop de tentatives de connexion. Réessayez dans quelques minutes.',
+          ) ||
+          rejectWhenRateLimited(
+            res,
+            ipState,
+            'Trop de tentatives de connexion depuis cet appareil. Réessayez dans quelques minutes.',
+          )
+        ) {
+          return true
+        }
+
+        let result: Awaited<ReturnType<typeof loginUserOnNeon>>
+        try {
+          result = await loginUserOnNeon(
+            pool,
+            { email: body.email ?? '', password: body.password ?? '' },
+            { expectedPin },
+          )
+        } catch (err) {
+          // Seuls les échecs alimentent la limitation (pas les succès).
+          recordRateLimitFailure(identityKey, RATE_LIMITS.loginPerIdentity)
+          recordRateLimitFailure(ipKey, RATE_LIMITS.loginPerIp)
+          throw err
+        }
+        resetRateLimit(identityKey)
         sendJson(res, 200, {
           ok: true,
           ...result,
@@ -253,6 +354,124 @@ export async function handleSalonApiRequest(
       ok: false,
       code: 'NOT_FOUND',
       message: `Route Auth introuvable : ${req.method} ${pathname}`,
+    })
+    return true
+  }
+
+  // 3. Administration des comptes (/api/users*) — session Gérant OBLIGATOIRE.
+  //    Aucune création, promotion ou réécriture de compte ne peut transiter
+  //    par la synchronisation (audit §6.1 S1/S3).
+  if (pathname === '/api/users' || pathname.startsWith('/api/users/')) {
+    if (!callerSession) {
+      sendJson(res, 401, {
+        ok: false,
+        code: 'SESSION_REQUIRED',
+        message:
+          "Connectez-vous avec un compte Gérant pour administrer les comptes du salon.",
+      })
+      return true
+    }
+    if (!pool) {
+      sendJson(res, 503, {
+        ok: false,
+        code: 'DB_NOT_CONFIGURED',
+        message:
+          "DATABASE_URL n'est pas configurée côté serveur : gestion des comptes indisponible.",
+      })
+      return true
+    }
+    if (callerSession.role !== 'manager') {
+      sendJson(res, 403, {
+        ok: false,
+        code: 'MANAGER_ROLE_REQUIRED',
+        message: 'Seul un compte Gérant peut administrer les comptes du salon.',
+      })
+      return true
+    }
+    if (
+      rejectWhenRateLimited(
+        res,
+        consumeRateLimit(
+          `user-admin:${callerSession.uid}`,
+          RATE_LIMITS.userAdminPerActor,
+        ),
+        "Trop d'opérations d'administration de comptes. Réessayez dans quelques minutes.",
+      )
+    ) {
+      return true
+    }
+
+    if (pathname === '/api/users' && req.method === 'GET') {
+      try {
+        const users = await listUsersOnNeon(pool, callerSession)
+        sendJson(res, 200, { ok: true, users })
+      } catch (err) {
+        const formatted = formatDbError(err)
+        sendJson(res, formatted.status, {
+          ok: false,
+          code: formatted.code,
+          message: formatted.message,
+        })
+      }
+      return true
+    }
+
+    if (pathname === '/api/users/provision' && req.method === 'POST') {
+      try {
+        const body = (await readJsonBody(req)) as { accounts?: unknown }
+        const result = await provisionUsersOnNeon(pool, body, callerSession)
+        console.info(
+          `[audit] user.provision actor=${callerSession.uid} created=${result.created} skipped=${result.skipped} invalid=${result.invalid}`,
+        )
+        sendJson(res, 200, { ok: true, ...result })
+      } catch (err) {
+        const formatted = formatDbError(err)
+        sendJson(res, formatted.status, {
+          ok: false,
+          code: formatted.code,
+          message: formatted.message,
+        })
+      }
+      return true
+    }
+
+    if (
+      pathname.startsWith('/api/users/') &&
+      req.method === 'PATCH'
+    ) {
+      try {
+        const targetId = decodeURIComponent(
+          pathname.slice('/api/users/'.length),
+        ).trim()
+        if (!targetId) {
+          sendJson(res, 400, {
+            ok: false,
+            code: 'INVALID_USER_ID',
+            message: 'Identifiant de compte manquant.',
+          })
+          return true
+        }
+        const body = (await readJsonBody(req)) as UpdateUserInput
+        const user = await updateUserOnNeon(pool, targetId, body, callerSession)
+        console.info(
+          `[audit] user.update actor=${callerSession.uid} target=${targetId} role=${user.role} active=${user.isActive}`,
+        )
+        sendJson(res, 200, { ok: true, user })
+      } catch (err) {
+        const formatted = formatDbError(err)
+        sendJson(res, formatted.status, {
+          ok: false,
+          code: formatted.code,
+          message: formatted.message,
+        })
+      }
+      return true
+    }
+
+    sendJson(res, 404, {
+      ok: false,
+      code: 'NOT_FOUND',
+      message: `Route Users introuvable : ${req.method} ${pathname}`,
     })
     return true
   }

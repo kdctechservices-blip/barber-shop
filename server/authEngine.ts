@@ -97,13 +97,54 @@ export function toPublicUser(account: SalonUserAccount): PublicSalonUser {
   return rest
 }
 
+/**
+ * Politique de mot de passe du produit (alignée client/serveur).
+ * Voir AGENTS.md §3 : aucun secret par défaut, uniquement des secrets réels.
+ */
+export const PASSWORD_MIN_LENGTH = 8
+export const PASSWORD_MAX_LENGTH = 200
+
+export function assertStrongPassword(password: string): void {
+  const value = password ?? ''
+  const hasLetter = /[A-Za-z]/.test(value)
+  const hasDigit = /\d/.test(value)
+  if (
+    value.length < PASSWORD_MIN_LENGTH ||
+    value.length > PASSWORD_MAX_LENGTH ||
+    !hasLetter ||
+    !hasDigit
+  ) {
+    throw new AuthApiError(
+      400,
+      'WEAK_PASSWORD',
+      `Le mot de passe doit contenir au moins ${PASSWORD_MIN_LENGTH} caractères, avec au moins une lettre et un chiffre.`,
+    )
+  }
+}
+
+function isProductionRuntime(): boolean {
+  return (
+    process.env.NODE_ENV === 'production' || process.env.VERCEL === '1'
+  )
+}
+
+/**
+ * En production, `SALON_AUTH_SECRET` est OBLIGATOIRE : sans lui, chaque
+ * instance serverless générerait un secret différent et invaliderait les
+ * sessions de façon imprévisible (voir audit §6.1 S7).
+ */
 function getSigningSecret(fallbackSecret?: string): string {
-  const raw =
-    process.env.SALON_AUTH_SECRET ??
-    fallbackSecret ??
-    process.env.SALON_SYNC_PIN ??
-    ''
-  return raw.trim() || loadOrCreatePersistentRuntimeSecret()
+  const explicit = (process.env.SALON_AUTH_SECRET ?? '').trim()
+  if (explicit) return explicit
+  if (isProductionRuntime()) {
+    throw new AuthApiError(
+      500,
+      'AUTH_SECRET_MISSING',
+      'SALON_AUTH_SECRET doit être configuré côté serveur en production (voir .env.example).',
+    )
+  }
+  const fallback = (fallbackSecret ?? process.env.SALON_SYNC_PIN ?? '').trim()
+  return fallback || loadOrCreatePersistentRuntimeSecret()
 }
 
 export function signAuthSessionToken(
@@ -227,13 +268,7 @@ export async function registerUserOnNeon(
       'Veuillez saisir une adresse e-mail valide.',
     )
   }
-  if (password.length < 6) {
-    throw new AuthApiError(
-      400,
-      'WEAK_PASSWORD',
-      'Le mot de passe doit contenir au moins 6 caractères.',
-    )
-  }
+  assertStrongPassword(password)
 
   await ensureNeonSchema(pool)
 
@@ -447,4 +482,301 @@ export async function loginUserOnNeon(
     recordForCache: updatedAccount,
     sessionToken: signAuthSessionToken(updatedAccount, options?.expectedPin),
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Administration des comptes — réservée au Gérant (jamais via la synchro)     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Un payload de synchronisation ne doit JAMAIS pouvoir créer, promouvoir ou
+ * réécrire un compte. Toute administration de compte passe par ces fonctions,
+ * protégées par une session Gérant vérifiée côté serveur (audit §6.1 S1/S3).
+ */
+function assertManagerActor(actor: SessionTokenPayload | null | undefined): void {
+  if (!actor) {
+    throw new AuthApiError(
+      401,
+      'SESSION_REQUIRED',
+      'Authentification requise pour administrer les comptes.',
+    )
+  }
+  if (actor.role !== 'manager') {
+    throw new AuthApiError(
+      403,
+      'MANAGER_ROLE_REQUIRED',
+      'Seul un compte Gérant peut administrer les comptes du salon.',
+    )
+  }
+}
+
+async function readAllAccounts(pool: SqlPoolLike): Promise<SalonUserAccount[]> {
+  const res = await pool.query<{ payload_json: SalonUserAccount | string }>(
+    'SELECT payload_json FROM salon_users ORDER BY created_at ASC',
+  )
+  return res.rows.map((r) => parseAccountRow(r.payload_json))
+}
+
+function isIsoDate(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && !Number.isNaN(Date.parse(value))
+}
+
+function isValidPasswordHash(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    /^pbkdf2_sha256\$\d{4,7}\$[0-9a-f]{32}\$[0-9a-f]{64}$/.test(value)
+  )
+}
+
+export interface UserProvisioningResult {
+  created: number
+  skipped: number
+  invalid: number
+}
+
+/**
+ * Provisionne (création seule, jamais de mise à jour) les comptes créés
+ * hors-ligne par un Gérant. Les identifiants déjà connus sont ignorés : un
+ * payload ne peut donc pas écraser un rôle ou un hash existant.
+ */
+export async function provisionUsersOnNeon(
+  pool: SqlPoolLike,
+  input: { accounts?: unknown },
+  actor: SessionTokenPayload | null | undefined,
+): Promise<UserProvisioningResult> {
+  assertManagerActor(actor)
+  await ensureNeonSchema(pool)
+
+  const rawAccounts = Array.isArray(input.accounts) ? input.accounts : []
+  const existing = await readAllAccounts(pool)
+  const existingIds = new Set(existing.map((u) => u.id))
+  const existingEmails = new Set(existing.map((u) => normalizeEmail(u.email)))
+
+  let created = 0
+  let skipped = 0
+  let invalid = 0
+
+  for (const raw of rawAccounts.slice(0, 200)) {
+    if (!raw || typeof raw !== 'object') {
+      invalid += 1
+      continue
+    }
+    const candidate = raw as Partial<SalonUserAccount>
+    const id = typeof candidate.id === 'string' ? candidate.id.trim() : ''
+    const email = normalizeEmail(
+      typeof candidate.email === 'string' ? candidate.email : '',
+    )
+    const fullName =
+      typeof candidate.fullName === 'string' ? candidate.fullName.trim() : ''
+    const role = candidate.role
+    const passwordHash = candidate.passwordHash
+    const createdAt = candidate.createdAt
+    const updatedAt = candidate.updatedAt
+
+    const isStructurallyValid =
+      /^[A-Za-z0-9_-]{6,80}$/.test(id) &&
+      /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) &&
+      email.length <= 254 &&
+      fullName.length >= 2 &&
+      fullName.length <= 120 &&
+      (role === 'manager' || role === 'cashier') &&
+      isValidPasswordHash(passwordHash) &&
+      isIsoDate(createdAt) &&
+      isIsoDate(updatedAt)
+
+    if (!isStructurallyValid) {
+      invalid += 1
+      continue
+    }
+
+    if (existingIds.has(id) || existingEmails.has(email)) {
+      // Compte déjà connu : on n'écrase ni le rôle ni le hash de mot de passe.
+      skipped += 1
+      continue
+    }
+
+    const account: SalonUserAccount = {
+      id,
+      fullName,
+      email,
+      phone:
+        typeof candidate.phone === 'string' && candidate.phone.trim()
+          ? candidate.phone.trim().slice(0, 30)
+          : undefined,
+      role: role as UserRole,
+      passwordHash,
+      isActive: candidate.isActive !== false,
+      lastLoginAt: isIsoDate(candidate.lastLoginAt)
+        ? candidate.lastLoginAt
+        : undefined,
+      createdAt,
+      updatedAt,
+    }
+
+    try {
+      await pool.query(
+        `INSERT INTO salon_users (id, email, full_name, phone, role, password_hash, is_active, last_login_at, created_at, updated_at, payload_json)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          account.id,
+          account.email,
+          account.fullName,
+          account.phone ?? null,
+          account.role,
+          account.passwordHash,
+          account.isActive,
+          account.lastLoginAt ?? null,
+          account.createdAt,
+          account.updatedAt,
+          JSON.stringify(account),
+        ],
+      )
+      created += 1
+      existingIds.add(account.id)
+      existingEmails.add(account.email)
+    } catch {
+      // Violation d'unicité concurrente (23505) : le compte existe déjà.
+      skipped += 1
+    }
+  }
+
+  return { created, skipped, invalid }
+}
+
+export async function listUsersOnNeon(
+  pool: SqlPoolLike,
+  actor: SessionTokenPayload | null | undefined,
+): Promise<PublicSalonUser[]> {
+  assertManagerActor(actor)
+  await ensureNeonSchema(pool)
+  return (await readAllAccounts(pool)).map(toPublicUser)
+}
+
+export interface UpdateUserInput {
+  fullName?: string
+  phone?: string
+  role?: UserRole
+  isActive?: boolean
+  password?: string
+}
+
+/**
+ * Met à jour un compte : rôle, activation, identité ou mot de passe.
+ * Le mot de passe est TOUJOURS haché côté serveur (jamais reçu haché).
+ */
+export async function updateUserOnNeon(
+  pool: SqlPoolLike,
+  targetUserId: string,
+  input: UpdateUserInput,
+  actor: SessionTokenPayload | null | undefined,
+): Promise<PublicSalonUser> {
+  assertManagerActor(actor)
+  await ensureNeonSchema(pool)
+
+  const accounts = await readAllAccounts(pool)
+  const target = accounts.find((u) => u.id === targetUserId)
+  if (!target) {
+    throw new AuthApiError(404, 'USER_NOT_FOUND', 'Compte introuvable.')
+  }
+
+  const activeManagers = accounts.filter(
+    (u) => u.role === 'manager' && u.isActive,
+  )
+  const isLastActiveManager =
+    target.role === 'manager' &&
+    target.isActive &&
+    activeManagers.length <= 1
+
+  const nextRole = input.role ?? target.role
+  const nextIsActive = input.isActive ?? target.isActive
+
+  if (nextRole !== 'manager' && isLastActiveManager) {
+    throw new AuthApiError(
+      409,
+      'LAST_MANAGER_REQUIRED',
+      'Impossible de retirer le rôle Gérant au dernier Gérant actif du salon.',
+    )
+  }
+  if (!nextIsActive && isLastActiveManager) {
+    throw new AuthApiError(
+      409,
+      'LAST_MANAGER_REQUIRED',
+      'Impossible de désactiver le dernier Gérant actif du salon.',
+    )
+  }
+  if (actor && actor.uid === target.id && !nextIsActive) {
+    throw new AuthApiError(
+      409,
+      'CANNOT_DEACTIVATE_SELF',
+      'Vous ne pouvez pas désactiver votre propre compte.',
+    )
+  }
+
+  if (input.fullName !== undefined) {
+    const fullName = input.fullName.trim()
+    if (fullName.length < 2 || fullName.length > 120) {
+      throw new AuthApiError(
+        400,
+        'INVALID_NAME',
+        'Veuillez renseigner un nom complet valide (2 à 120 caractères).',
+      )
+    }
+  }
+
+  let nextPasswordHash = target.passwordHash
+  if (input.password !== undefined) {
+    assertStrongPassword(input.password)
+    nextPasswordHash = hashPasswordNode(input.password)
+  }
+
+  // Horodatage serveur strictement croissant : un enregistrement client
+  // antidaté ne peut pas bloquer la mise à jour (audit §6.1 S5).
+  const existingUpdatedMs = Date.parse(target.updatedAt)
+  const nowMs = Date.now()
+  const updatedAt = new Date(
+    Math.max(nowMs, Number.isNaN(existingUpdatedMs) ? nowMs : existingUpdatedMs + 1),
+  ).toISOString()
+
+  const updated: SalonUserAccount = {
+    ...target,
+    fullName: input.fullName !== undefined ? input.fullName.trim() : target.fullName,
+    phone:
+      input.phone !== undefined ? input.phone.trim().slice(0, 30) || undefined : target.phone,
+    role: nextRole,
+    isActive: nextIsActive,
+    passwordHash: nextPasswordHash,
+    updatedAt,
+  }
+
+  await pool.query(
+    `INSERT INTO salon_users (id, email, full_name, phone, role, password_hash, is_active, last_login_at, created_at, updated_at, payload_json)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+     ON CONFLICT (id) DO UPDATE SET
+       email = EXCLUDED.email,
+       full_name = EXCLUDED.full_name,
+       phone = EXCLUDED.phone,
+       role = EXCLUDED.role,
+       password_hash = EXCLUDED.password_hash,
+       is_active = EXCLUDED.is_active,
+       last_login_at = EXCLUDED.last_login_at,
+       updated_at = EXCLUDED.updated_at,
+       payload_json = EXCLUDED.payload_json
+     WHERE EXCLUDED.updated_at > salon_users.updated_at`,
+    [
+      updated.id,
+      updated.email,
+      updated.fullName,
+      updated.phone ?? null,
+      updated.role,
+      updated.passwordHash,
+      updated.isActive,
+      updated.lastLoginAt ?? null,
+      updated.createdAt,
+      updated.updatedAt,
+      JSON.stringify(updated),
+    ],
+  )
+
+  return toPublicUser(updated)
 }

@@ -2925,15 +2925,16 @@ export class SalonRepositoryHub {
   }
 
   /**
-   * Prépare l'enveloppe de synchronisation vers Neon PostgreSQL.
+   * Enveloppe de synchronisation Cloud : les comptes utilisateurs en sont
+   * volontairement EXCLUS (audit §6.1 S1). Ils sont provisionnés par un
+   * endpoint dédié, réservé au Gérant (`/api/users/provision`).
    */
   public async buildCloudSyncEnvelope(): Promise<{
     payload: SalonBackupPayload
     tombstones: LocalSyncTombstone[]
   }> {
-    const [state, users, persistedTombstones] = await Promise.all([
+    const [state, persistedTombstones] = await Promise.all([
       this.readFullState(),
-      this.database.users.toArray(),
       this.database.syncTombstones.toArray(),
     ])
     return {
@@ -2956,7 +2957,6 @@ export class SalonRepositoryHub {
         stockMovements: state.stockMovements,
         budgets: state.budgets,
         recurringExpenses: state.recurringExpenses,
-        users,
         correctionLogs: state.correctionLogs,
       },
       tombstones: persistedTombstones.map((tb) => ({
@@ -2965,6 +2965,18 @@ export class SalonRepositoryHub {
         deletedAt: tb.deletedAt,
       })),
     }
+  }
+
+  /**
+   * Comptes locaux à provisionner côté Cloud après une création hors-ligne.
+   * Transmet les hashes PBKDF2 déjà calculés localement, mais le serveur
+   * n'accepte QUE des créations (jamais d'écrasement d'un compte existant).
+   */
+  public async buildUserProvisioningEnvelope(): Promise<{
+    accounts: SalonUserAccount[]
+  }> {
+    const accounts = await this.database.users.toArray()
+    return { accounts }
   }
 
   /**
@@ -3070,24 +3082,8 @@ export class SalonRepositoryHub {
         )
         await mergeByUpdatedAt(this.database.budgets, remote.budgets)
 
-        for (const usr of remote.users ?? []) {
-          const curById = await this.database.users.get(usr.id)
-          const curByEmail = await this.database.users
-            .where('email')
-            .equals(usr.email.trim().toLowerCase())
-            .first()
-          const cur = curById ?? curByEmail
-          if (!cur || usr.updatedAt > cur.updatedAt) {
-            if (cur && cur.id !== usr.id) {
-              await this.database.users.delete(cur.id)
-            }
-            await this.database.users.put({
-              ...usr,
-              email: usr.email.trim().toLowerCase(),
-            })
-            mergedCount += 1
-          }
-        }
+        // Les comptes ne sont jamais fusionnés depuis un payload distant
+        // (audit §6.1 S1) : ils passent uniquement par /api/users*.
 
         await mergeImmutableById(
           this.database.stockMovements,
@@ -3302,8 +3298,14 @@ export class SalonRepositoryHub {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       throw new Error('Veuillez saisir une adresse e-mail valide.')
     }
-    if (password.length < 6) {
-      throw new Error('Le mot de passe doit contenir au moins 6 caractères.')
+    if (
+      password.length < 8 ||
+      !/[A-Za-z]/.test(password) ||
+      !/\d/.test(password)
+    ) {
+      throw new Error(
+        'Le mot de passe doit contenir au moins 8 caractères, avec au moins une lettre et un chiffre.',
+      )
     }
 
     const existing = await this.database.users

@@ -43,6 +43,21 @@
 2. Le schéma PostgreSQL complet (`19` tables relationnelles incluant `salon_users` + `sync_tombstones`) est initialisé automatiquement au premier appel, ou exécutable manuellement dans l'éditeur SQL Neon via `db/schema.sql`.
 3. Dans l'application, ouvrez **Paramètres → Cloud Neon** puis cliquez sur **Activer la synchronisation Neon**.
 
+### 3.1 Sécurité, rôles et administration des comptes
+
+- **`SALON_AUTH_SECRET` est obligatoire en production** (Vercel). Sans lui, chaque instance serverless signerait les sessions avec un secret différent et déconnecterait les utilisateurs. Génération : `openssl rand -hex 32`.
+- **Les comptes utilisateurs ne transitent jamais par la synchronisation.** Un payload `SALON_PRO_BACKUP_V1` ne peut donc ni créer, ni promouvoir, ni réécrire un compte (rôle ou hash de mot de passe). Toute administration passe par des routes dédiées, réservées à une session **Gérant** :
+  | Route | Méthode | Rôle | Usage |
+  |---|---|---|---|
+  | `/api/users` | `GET` | Gérant | Liste des comptes (jamais de hash exposé) |
+  | `/api/users/provision` | `POST` | Gérant | Provisionne les comptes créés hors-ligne (création seule, jamais d'écrasement) |
+  | `/api/users/:id` | `PATCH` | Gérant | Rôle, activation, identité, réinitialisation de mot de passe (haché côté serveur) |
+- **Garde-fous serveur** : impossible de retirer le rôle ou de désactiver le **dernier Gérant actif**, ni de désactiver son propre compte.
+- **Politique de mot de passe** : 8 caractères minimum, avec au moins une lettre et un chiffre (appliquée côté serveur **et** en mode hors-ligne).
+- **Anti-bruteforce** : 5 tentatives échouées par identifiant et par IP sur 15 minutes, 30 tentatives par IP, 10 créations de compte par heure.
+- **En-têtes de sécurité** (CSP, HSTS, `X-Frame-Options`, `nosniff`, `Referrer-Policy`, `Permissions-Policy`) configurés dans `vercel.json`.
+- La synchronisation machine sans session (`SALON_SYNC_PIN`) reste possible pour compatibilité, mais elle est **dépréciée** et ne donne aucun accès à l'administration des comptes.
+
 ---
 
 ## 4. Installation, lancement et tests

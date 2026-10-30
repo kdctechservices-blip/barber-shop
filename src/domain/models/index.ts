@@ -413,6 +413,11 @@ export interface SalonBackupPayload {
   stockMovements: StockMovement[]
   budgets: BudgetTarget[]
   recurringExpenses?: RecurringExpenseTemplate[]
+  /**
+   * Comptes utilisateurs — utilisés UNIQUEMENT par la sauvegarde/restauration
+   * JSON locale (action explicite du Gérant). Ils ne sont JAMAIS transmis au
+   * Cloud : voir `buildCloudSyncEnvelope` et `/api/users/provision`.
+   */
   users?: SalonUserAccount[]
   correctionLogs: CorrectionLog[]
 }

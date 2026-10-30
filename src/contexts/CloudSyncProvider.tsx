@@ -190,6 +190,28 @@ export function CloudSyncProvider({ children }: { children: ReactNode }) {
           }),
         )
 
+        // Provisionnement des comptes créés hors-ligne : route dédiée,
+        // réservée au Gérant (un Caissier reçoit 403, ignoré silencieusement).
+        if (savedSessionToken) {
+          try {
+            const provisioning = await syncWithRepo((repo) =>
+              repo.buildUserProvisioningEnvelope(),
+            )
+            if (provisioning.accounts.length > 0) {
+              await window.fetch('/api/users/provision', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${savedSessionToken}`,
+                },
+                body: JSON.stringify(provisioning),
+              })
+            }
+          } catch {
+            // Best-effort : la synchronisation des données reste prioritaire.
+          }
+        }
+
         const syncedAt = data.syncedAt ?? new Date().toISOString()
         const remoteRecordsCount =
           typeof data.stats?.totalRemoteRecords === 'number'

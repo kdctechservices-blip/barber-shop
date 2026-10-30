@@ -74,6 +74,22 @@ export interface CloudSyncResult {
   tombstones: SyncTombstone[]
 }
 
+/**
+ * Retire les comptes utilisateurs d'un payload de synchronisation.
+ * Défense en profondeur : même si un client (ou un attaquant) envoie des
+ * comptes, ils ne sont ni persistés, ni renvoyés.
+ */
+export function stripUsersFromSyncPayload(payload: SalonBackupPayload): {
+  payload: SalonBackupPayload
+  hadUsers: boolean
+} {
+  const hadUsers = Array.isArray(payload.users) && payload.users.length > 0
+  if (!hadUsers) return { payload, hadUsers }
+  const { users: _ignoredUsers, ...rest } = payload
+  void _ignoredUsers
+  return { payload: rest as SalonBackupPayload, hadUsers }
+}
+
 let schemaInitializedForPool = new WeakSet<object>()
 
 export async function ensureNeonSchema(pool: SqlPoolLike): Promise<void> {
@@ -318,7 +334,8 @@ export async function readFullCloudState(
       stockMovements: stockMovementsClean,
       budgets: budgetsClean,
       recurringExpenses: recurringClean,
-      users,
+      // `users` est volontairement exclu : les comptes (rôles + hashes) ne sont
+      // jamais exposés à un client via la synchronisation (audit §6.1 S1).
       correctionLogs: correctionLogsClean,
     },
     tombstones,
@@ -342,7 +359,13 @@ export async function syncWithNeonDatabase(
   try {
     await client.query('BEGIN')
 
-    const p = incoming.payload
+    const { payload: p, hadUsers } = stripUsersFromSyncPayload(incoming.payload)
+    if (hadUsers) {
+      console.warn(
+        '[security] Payload de synchronisation contenant des comptes ignoré : ' +
+          "l'administration des comptes passe exclusivement par /api/users.",
+      )
+    }
 
     // 1. SalonInfo (nettoyé de toute valeur fictive héritée)
     if (p.salon) {
@@ -798,38 +821,8 @@ export async function syncWithNeonDatabase(
       pushedRecords += r.rowCount ?? 0
     }
 
-    // 12. CorrectionLogs & Comptes Utilisateurs
-    for (const usr of p.users ?? []) {
-      const r = await client.query(
-        `INSERT INTO salon_users (id, email, full_name, phone, role, password_hash, is_active, last_login_at, created_at, updated_at, payload_json)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
-         ON CONFLICT (id) DO UPDATE SET
-           email = EXCLUDED.email,
-           full_name = EXCLUDED.full_name,
-           phone = EXCLUDED.phone,
-           role = EXCLUDED.role,
-           password_hash = EXCLUDED.password_hash,
-           is_active = EXCLUDED.is_active,
-           last_login_at = EXCLUDED.last_login_at,
-           updated_at = EXCLUDED.updated_at,
-           payload_json = EXCLUDED.payload_json
-         WHERE EXCLUDED.updated_at > salon_users.updated_at`,
-        [
-          usr.id,
-          usr.email,
-          usr.fullName,
-          usr.phone ?? null,
-          usr.role,
-          usr.passwordHash,
-          usr.isActive,
-          usr.lastLoginAt ?? null,
-          usr.createdAt,
-          usr.updatedAt,
-          JSON.stringify(usr),
-        ],
-      )
-      pushedRecords += r.rowCount ?? 0
-    }
+    // Les comptes utilisateurs ne transitent JAMAIS par la synchronisation
+    // (audit §6.1 S1) : ils sont administrés uniquement via /api/users*.
 
     for (const log of (p.correctionLogs ?? []).filter(
       (x) => !isLegacyMockRecord(x),

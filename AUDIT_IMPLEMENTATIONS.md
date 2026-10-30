@@ -5,6 +5,8 @@
 > **Date** : 30 octobre 2026 · **Branche** : `arena/139c7e36-barber-shop` · **Commit analysé** : `74a1d91` (+ correctif P0 appliqué pendant l'audit, voir §1.4)
 > **Périmètre** : 100 % du code versionné (frontend React, serveur API, schéma PostgreSQL, tests, configuration de déploiement).
 > **Nature** : audit statique + exécution réelle des chaînes de validation (`lint`, `test`, `build`) + revue de sécurité et d'architecture. Aucune modification fonctionnelle hors du correctif P0 explicitement isolé.
+>
+> **Mise à jour Sprint 1 (30/10/2026)** : les constats critiques n° 2 (escalade via `/api/sync`) et n° 3 (administration des comptes) sont traités, ainsi que le durcissement de l'authentification et la CI. Voir §11 pour le suivi détaillé et les points restants.
 
 ---
 
@@ -650,6 +652,48 @@ Estimations : **j-h**, 1 développeur senior + assistance IA. `P0` = bloquant s�
 | **D5** | Priorité commerciale : **abonnements + console éditeur** (P1) ou **agenda + WhatsApp** (acquisition) ? | **Abonnements d'abord** : sans encaissement récurrent, l'acquisition ne finance pas le développement. L'agenda suit immédiatement. |
 
 ---
+
+## 11. Suivi des correctifs — Sprint 1 (implémenté)
+
+> Mise à jour du 30 octobre 2026, branche `arena/139c7e36-barber-shop`. Le périmètre P0-1 / P0-5 / P0-8 du backlog a été implémenté et validé.
+
+### 11.1 Vulnérabilités traitées
+
+| ID | Statut | Correctif livré |
+|---|---|---|
+| **S1** (critique) — escalade via `/api/sync` | ✅ **Corrigée** | `users` retiré de `buildCloudSyncEnvelope`, ignoré côté serveur (`stripUsersFromSyncPayload`), absent des payloads de pull et de la fusion locale. Routes dédiées `/api/users`, `/api/users/provision`, `PATCH /api/users/:id` réservées au Gérant, avec provisionnement en **création seule** (aucun écrasement de rôle ou de hash). |
+| **S3** (élevée) — aucune autorisation serveur | 🟡 **Partielle** | Autorisation serveur ajoutée sur toute l'administration des comptes (401 sans session, 403 hors Gérant, rate limit par acteur). L'autorisation **par entité métier** sur `/api/sync*` reste à faire avec la synchronisation delta (P0-3/P0-6). |
+| **S4** (élevée) — sessions non révocables | ❌ **Non traitée** | Nécessite la table `sessions` et le couple access/refresh : reporté au Sprint 2. |
+| **S5** (élevée) — LWW sur horodatage client | 🟡 **Partielle** | Les mises à jour de comptes utilisent désormais un horodatage serveur strictement croissant ; les données métier restent en LWW client jusqu'à P0-6. |
+| **S6** (moyenne) — bruteforce / politique faible | ✅ **Corrigée** | Rate limiting (5/identité + 30/IP sur 15 min, 10 inscriptions/heure), politique 8 caractères lettre + chiffre côté serveur **et** hors-ligne, buckets réinitialisés après une connexion réussie. |
+| **S7** (moyenne) — secret non persistant en serverless | ✅ **Corrigée** | `SALON_AUTH_SECRET` obligatoire en production (`AUTH_SECRET_MISSING` explicite) ; repli local persistant conservé hors production. |
+| **S10** (faible) — en-têtes de sécurité absents | ✅ **Corrigée** | `vercel.json` : CSP, HSTS, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy`, `Permissions-Policy` ; `X-Content-Type-Options` sur toutes les réponses API. |
+| **S11** (faible) — fuites d'information | 🟡 **Partielle** | `/api/health` et `/api/auth/status` conservés pour la compatibilité de l'UI (aucun secret exposé) ; à revoir avec la télémétrie (P1-3). |
+
+### 11.2 Garde-fous supplémentaires livrés
+
+- Impossible de retirer le rôle Gérant ou de désactiver le **dernier Gérant actif** (`LAST_MANAGER_REQUIRED`), ni de désactiver son propre compte.
+- Les hashes de mots de passe ne sont **jamais** renvoyés par `GET /api/users` (vérifié par test).
+- Toute opération d'administration est journalisée (`[audit] user.provision|user.update`) ; l'écriture en base (`audit_events`) reste au backlog P1-3.
+- Intégration continue ajoutée (`.github/workflows/ci.yml`) : lint + tests + build sur chaque PR et sur `main`.
+
+### 11.3 Validation
+
+| Commande | Résultat |
+|---|---|
+| `npm run lint` | 0 erreur, 0 avertissement (107 fichiers) |
+| `npm test` | **61/61** tests verts (12 fichiers, dont 12 nouveaux tests de sécurité) |
+| `npm run build` | OK |
+
+Nouveaux tests (`src/test/securityHardening.test.ts`) couvrant : injection de comptes dans un payload de sync, absence de comptes dans l'enveloppe client, provisionnement en création seule, refus d'escalade, protection du dernier Gérant, hachage serveur, politique de mot de passe, blocage bruteforce et libération du compteur, secret obligatoire en production.
+
+### 11.4 Reste à faire (Sprint 2)
+
+1. **S4** — table `sessions`, jetons d'accès courts + refresh rotatif, révocation à la déconnexion.
+2. **P0-2** — `organizations`/`tenants`/`memberships`, `tenant_id` + RLS sur les 19 tables.
+3. **P0-4** — migrations versionnées (remplacer `CREATE TABLE IF NOT EXISTS`).
+4. **P0-6** — synchronisation delta serveur-autoritaire (résout S3 côté données et S5 définitivement).
+5. **P0-7** — service worker / mode hors-ligne réel.
 
 ## Annexe A — Inventaire des fichiers (par rôle)
 
