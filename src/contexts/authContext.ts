@@ -1,5 +1,6 @@
 import { createContext, useContext } from 'react'
 import type { PublicSalonUser, UserRole } from '../domain/models'
+import type { TenantMembership } from '../lib/teamClient'
 
 export type AuthMode = 'checking' | 'cloud_neon' | 'local_offline'
 
@@ -27,6 +28,12 @@ export interface AuthContextValue {
   currentUser: PublicSalonUser | null
   localAccounts: PublicSalonUser[]
   sessionToken: string | null
+  /** Salons du compte connecté (vide hors mode cloud). */
+  tenants: TenantMembership[]
+  /** Salon de la session courante (claim `tid`). */
+  activeTenantId: string | null
+  refreshTenants: () => Promise<void>
+  switchTenant: (tenantId: string) => Promise<void>
   refreshAuthStatus: () => Promise<void>
   login: (params: LoginAccountParams) => Promise<PublicSalonUser>
   register: (params: RegisterAccountParams) => Promise<PublicSalonUser>
@@ -39,6 +46,7 @@ export const MANAGER_ONLY_PREFIXES = [
   '/payroll',
   '/reports',
   '/settings',
+  '/team',
 ] as const
 
 export function canUserAccessPath(
@@ -69,6 +77,10 @@ const FALLBACK_AUTH_CONTEXT: AuthContextValue = {
   currentUser: FALLBACK_MANAGER_USER,
   localAccounts: [],
   sessionToken: null,
+  tenants: [],
+  activeTenantId: null,
+  refreshTenants: async () => {},
+  switchTenant: async () => {},
   refreshAuthStatus: async () => {},
   login: async () => FALLBACK_MANAGER_USER,
   register: async () => FALLBACK_MANAGER_USER,

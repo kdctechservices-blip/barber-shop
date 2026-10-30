@@ -18,11 +18,13 @@ import {
   Scissors,
   Search,
   Settings,
+  Store,
   Sun,
   Target,
   Unlock,
   UserPlus,
   Users,
+  UsersRound,
   Wallet,
   X,
   type LucideIcon,
@@ -81,6 +83,7 @@ const NAV_GROUPS: Array<{
       { to: '/services', label: 'Prestations et tarifs', icon: Scissors },
       { to: '/employees', label: 'Personnel', icon: Users },
       { to: '/payroll', label: 'Salaires et commissions', icon: Award },
+      { to: '/team', label: 'Équipe et abonnement', icon: UsersRound },
     ],
   },
   {
@@ -465,6 +468,46 @@ export function MainLayout() {
             >
               <Menu size={20} />
             </button>
+
+            {auth.tenants.length > 1 && (
+              <label
+                title="Changer de salon"
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  fontSize: '0.78rem',
+                  color: 'var(--text-muted)',
+                }}
+              >
+                <Store size={14} />
+                <select
+                  aria-label="Salon actif"
+                  value={auth.activeTenantId ?? ''}
+                  onChange={(event) => {
+                    const target = event.target.value
+                    if (target && target !== auth.activeTenantId) {
+                      void auth.switchTenant(target)
+                    }
+                  }}
+                  style={{
+                    height: 30,
+                    borderRadius: 8,
+                    border: '1px solid var(--border-subtle)',
+                    background: 'var(--bg-surface-muted)',
+                    color: 'inherit',
+                    padding: '0 6px',
+                    maxWidth: 180,
+                  }}
+                >
+                  {auth.tenants.map((tenant) => (
+                    <option key={tenant.tenantId} value={tenant.tenantId}>
+                      {tenant.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
 
             <button
               type="button"

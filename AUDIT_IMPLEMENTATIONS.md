@@ -22,7 +22,7 @@ Légende : `0 %` = inexistant · `25 %` = socle partiel · `50 %` = à parité f
 
 | Phase (`IMPLEMENTATIONS.md` §6) | Périmètre | Maturité | Constat |
 |---|---|---|---|
-| **Phase 1 — Fondations SaaS** | Multi-tenant, auth, RBAC, abonnements, sauvegarde, audit/sécurité | **45 %** | Livrés (sprints 1-7) : tenant + RLS forcée, sessions révocables, RBAC par salon, synchronisation delta serveur-autoritaire, abonnements + essai + limites d'offre. **Restent** : audit sécurité en base (`audit_events`), sauvegarde automatique planifiée, console éditeur, moyen de paiement réel. |
+| **Phase 1 — Fondations SaaS** | Multi-tenant, auth, RBAC, abonnements, sauvegarde, audit/sécurité | **50 %** | Livrés (sprints 1-8) : tenant + RLS forcée, sessions révocables, RBAC par salon, synchronisation delta serveur-autoritaire, abonnements + essai + limites d'offre, **écran Équipe et sélecteur de salon**. **Restent** : audit sécurité en base (`audit_events`), sauvegarde automatique planifiée, console éditeur, moyen de paiement réel. |
 | **Phase 2 — Expérience client** | Agenda, réservation en ligne, CRM, fidélité, notifications | **5 %** | Aucun modèle de rendez-vous, aucun client (juste un `clientName` texte libre), aucune fidélité, aucun canal WhatsApp/SMS. |
 | **Phase 3 — Gestion professionnelle** | Stock avancé/fournisseurs, planning, rapports financiers, multi-agences, paiements | **50 %** | Cœur financier très solide (caisse, CUMP, paie, commissions, 8 états financiers). Manquent fournisseurs/BC, planning/présences, multi-agences, intégrations de paiement. |
 | **Phase 4 — Innovation** | SALON AI, prévisions, automatisations, mini-sites, portefeuille client | **8 %** | Seuls le *run-rate* budgétaire et les alertes proactives existent. Aucun mini-site public, aucun portail client, aucun assistant. |
@@ -654,9 +654,9 @@ Estimations : **j-h**, 1 développeur senior + assistance IA. `P0` = bloquant s�
 
 ---
 
-## 11. Suivi des correctifs — Sprints 1 à 7 (implémentés)
+## 11. Suivi des correctifs — Sprints 1 à 8 (implémentés)
 
-> Mise à jour du 30 octobre 2026, branche `arena/139c7e36-barber-shop`. Sprint 1 : périmètre P0-1 / P0-5 / P0-8 du backlog. Sprint 2 : P0-2 (isolation multi-tenant + RLS) et P0-4 (migrations versionnées). Sprint 3 : S4 (sessions révocables). Sprint 4 : P0-6 (synchronisation delta serveur-autoritaire). Sprint 5 : P0-7 (service worker hors-ligne). Sprint 6 : P1 (appartenances multi-salons et garde de rôle par entité). Sprint 7 : P1 (abonnements par organisation, essai, activation plateforme et limites d'offre).
+> Mise à jour du 30 octobre 2026, branche `arena/139c7e36-barber-shop`. Sprint 1 : périmètre P0-1 / P0-5 / P0-8 du backlog. Sprint 2 : P0-2 (isolation multi-tenant + RLS) et P0-4 (migrations versionnées). Sprint 3 : S4 (sessions révocables). Sprint 4 : P0-6 (synchronisation delta serveur-autoritaire). Sprint 5 : P0-7 (service worker hors-ligne). Sprint 6 : P1 (appartenances multi-salons et garde de rôle par entité). Sprint 7 : P1 (abonnements par organisation, essai, activation plateforme et limites d'offre). Sprint 8 : P1 (écran Équipe, sélecteur de salon, écran d'abonnement).
 
 ### 11.1 Vulnérabilités traitées
 
@@ -963,12 +963,52 @@ Le produit ne pouvait pas être **vendu au mois** : aucune notion d'offre, d'ess
 - `subscription_events` n'est pas encore purgé (même chantier de maintenance que `sync_changes` et `sessions`).
 - Aucune relance automatique avant échéance : `daysRemaining` est exposé par l'API, l'UI devra alerter.
 
-### 11.14 Reste à faire
 
-1. **P1** — écran « Équipe » basé sur `memberships`, sélecteur de salon et écran d'abonnement (consommation + limites + demande d'offre).
-2. **P1** — maintenance : purge des sessions expirées, du journal `sync_changes` et de `subscription_events`, écran « appareils connectés » (quota d'appareils), invite de mise à jour PWA.
-3. **P1** — intégration d'un moyen de paiement réel (Wave Business / CinetPay / PayDunya) appelant le canal d'activation, avec factures et relances.
-4. **P2** — dirty tracking côté client, politiques de droits par champ, notifications WhatsApp/SMS, CRM/fidélité.
+### 11.15 Sprint 8 — écran Équipe, sélecteur de salon et écran d'abonnement (implémenté)
+
+#### Pourquoi
+
+Les routes du sprint 6 (appartenances, bascule de salon) et du sprint 7 (abonnements, limites) existaient et étaient testées, mais **aucune interface** ne les exposait : le Gérant ne pouvait ni ajouter un collaborateur en ligne, ni voir sa consommation d'offre, ni changer de salon. L'écran « Équipe » est le point de convergence des deux sprints précédents.
+
+#### Ce qui est livré
+
+| Élément | Détail |
+|---|---|
+| Page `/team` | « Équipe et abonnement », **réservée au Gérant** (route protégée + entrée de menu), `src/features/team/TeamPage.tsx` |
+| Tableau des collaborateurs | Nom, e-mail, rôle (**changement immédiat** via PATCH), statut actif/désactivé, dernière connexion, action désactiver/réactiver |
+| Ajout d'un collaborateur | Modale (nom, e-mail, téléphone, mot de passe, rôle) → `POST /api/auth/register` avec la session Gérant. Le mot de passe est **haché côté serveur**, jamais dans le navigateur |
+| Bandeau d'offre | Offre effective, statut (`Essai en cours`, `Actif`, `En attente de paiement`, `Échéance dépassée`, `Résilié`), échéance et jours restants, consommation **membres / salons** face aux limites |
+| Offres disponibles | Cartes du catalogue (prix, salons, membres, appareils) + demande de changement d'offre. Une offre payante reste **en attente de paiement** : l'écran l'explique et ne demande aucune carte |
+| Résiliation | Bouton dédié, avec rappel que l'offre reste active jusqu'à la fin de la période payée |
+| Sélecteur de salon | Barre supérieure (`MainLayout`) : visible dès que le compte appartient à **plusieurs** salons, bascule via `POST /api/auth/switch-tenant`, jeton et utilisateur rechargés avant navigation |
+| Contexte d'authentification | `AuthContext` enrichi : `tenants`, `activeTenantId`, `refreshTenants()`, `switchTenant()`. `'/team'` ajouté aux préfixes réservés au Gérant (navigation filtrée) |
+| Mode local | Hors mode Neon, l'écran affiche les comptes de l'appareil et explique que la gestion d'équipe, la bascule et l'abonnement nécessitent la synchronisation (aucun appel réseau) |
+
+#### Validation
+
+| Commande | Résultat |
+|---|---|
+| `npm run lint` | 0 erreur, 0 avertissement (131 fichiers) |
+| `npm test` | **124/124** tests verts (22 fichiers) |
+| `npx tsc -b` | OK |
+| `npm run build` | OK — `sw.js` généré (38 fichiers, 1 561 Ko) |
+
+`src/test/teamClient.test.ts` (5 tests) couvre le client : liste des comptes avec jeton, ajout en POST, erreur **402 `PLAN_LIMIT_REACHED`** typée, changement de rôle (PATCH), liste des salons et bascule de session. `src/test/teamPage.test.tsx` (3 tests) couvre l'écran : rendu des collaborateurs et de la consommation (`2 / 25`, `1 / 2`), message d'aide à la suite d'un refus pour limite d'offre, et mode local sans aucun appel réseau.
+
+#### Décisions et limites
+
+- **Les droits ne sont jamais décidés par l'écran** : chaque action est re-vérifiée côté serveur (rôle Gérant en base, limite d'offre). Masquer un bouton n'est pas une sécurité, seulement du confort.
+- La bascule de salon **recharge l'application** (`/dashboard`) : les données locales IndexedDB sont propres à un salon et ne sont pas encore purgées/segmentées par salon côté client. C'est la principale limite restante du multi-salon côté navigateur.
+- L'écran ne gère ni les invitations par e-mail, ni la réinitialisation de mot de passe par envoi de lien (le Gérant peut redéfinir un mot de passe via l'API, l'UI dédiée reste à faire).
+- Pas d'écran de facturation détaillé (historique, factures PDF) : `subscription_events` est journalisé mais non exposé.
+- Le quota d'**appareils** reste non compté (aucun registre d'appareils).
+
+### 11.16 Reste à faire
+
+1. **P1** — maintenance : purge des sessions expirées, du journal `sync_changes` et de `subscription_events` ; écran « appareils connectés » (quota d'appareils) ; invite de mise à jour PWA.
+2. **P1** — purge/segmentation des données locales à la bascule de salon (aujourd'hui : rechargement), historique de facturation et factures.
+3. **P1** — intégration d'un moyen de paiement réel (Wave Business / CinetPay / PayDunya) appelant le canal d'activation, avec relances avant échéance.
+4. **P2** — dirty tracking côté client, politiques de droits par champ, notifications WhatsApp/SMS, CRM/fidélité, agenda et réservation en ligne.
 
 
 

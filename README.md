@@ -76,6 +76,8 @@
 - **Identité ≠ appartenance** : `salon_users` porte les identifiants et le hash du mot de passe ; la table `memberships` porte le **rôle et l'activation par salon**. Un compte peut donc travailler dans plusieurs salons avec des rôles différents.
 - `GET /api/auth/tenants` liste les salons d'un compte ; `POST /api/auth/switch-tenant` bascule la session (rôle issu de l'appartenance, ancienne session révoquée).
 - **Les droits sont vérifiés en base à chaque appel** : une rétrogradation prend effet immédiatement, sans attendre l'expiration du jeton ; un changement de rôle ou une désactivation révoque toutes les sessions du compte.
+- **Écran « Équipe et abonnement »** (`/team`, réservé au Gérant) : liste des collaborateurs du salon, changement de rôle, désactivation/réactivation, ajout d'un collaborateur, consommation et limites de l'offre, demande de changement d'offre et résiliation. Hors mode Neon, l'écran liste les comptes de l'appareil et rappelle que la gestion d'équipe est une fonction cloud.
+- **Sélecteur de salon** dans la barre supérieure : il apparaît dès qu'un compte appartient à plusieurs salons ; la bascule passe par `POST /api/auth/switch-tenant` (ancienne session révoquée, rôle du jeton issu de l'appartenance).
 - **Garde de rôle par entité** : un Caissier saisit recettes, dépenses, caisse et mouvements de stock ; il ne peut pas modifier la configuration du salon, les référentiels (prestations, employés, produits), les budgets, salaires, avances ni les journaux de correction, et ne peut rien supprimer. Les tentatives refusées sont renvoyées dans `rejected` (`WRITE_FORBIDDEN_FOR_ROLE`, `DELETE_FORBIDDEN_FOR_ROLE`).
 
 ### 3.5 Abonnements, essai et limites d'offre

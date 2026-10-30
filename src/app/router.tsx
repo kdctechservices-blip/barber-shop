@@ -71,6 +71,11 @@ const SettingsPage = lazy(() =>
     default: m.SettingsPage,
   })),
 )
+const TeamPage = lazy(() =>
+  import('../features/team/TeamPage').then((m) => ({
+    default: m.TeamPage,
+  })),
+)
 
 function RouteFallback() {
   return (
@@ -179,6 +184,14 @@ export function AppRoutes() {
                       element={
                         <RequireManagerRole>
                           <SettingsPage />
+                        </RequireManagerRole>
+                      }
+                    />
+                    <Route
+                      path="team"
+                      element={
+                        <RequireManagerRole>
+                          <TeamPage />
                         </RequireManagerRole>
                       }
                     />

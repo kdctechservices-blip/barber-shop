@@ -18,6 +18,11 @@ import {
   storeSessionTokens,
 } from '../lib/sessionClient'
 import {
+  fetchTenantMemberships,
+  switchActiveTenant,
+  type TenantMembership,
+} from '../lib/teamClient'
+import {
   AuthContext,
   type AuthMode,
   type LoginAccountParams,
@@ -104,6 +109,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [sessionToken, setSessionToken] = useState<string | null>(
     () => readPersistedAuth().token,
   )
+  const [tenants, setTenants] = useState<TenantMembership[]>([])
+  const [activeTenantId, setActiveTenantId] = useState<string | null>(null)
   const [authReady, setAuthReady] = useState(false)
   const [hasAnyManager, setHasAnyManager] = useState(false)
   const [authMode, setAuthMode] = useState<AuthMode>('checking')
@@ -395,6 +402,58 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [syncWithRepo],
   )
 
+  /**
+   * Salons du compte connecté. En local (hors-ligne) il n'y a qu'un salon
+   * implicite : la liste reste vide et le sélecteur est masqué.
+   */
+  const refreshTenants = useCallback(async () => {
+    if (!sessionToken) {
+      setTenants([])
+      setActiveTenantId(null)
+      return
+    }
+    try {
+      const result = await fetchTenantMemberships()
+      setTenants(result.tenants.filter((tenant) => tenant.isActive))
+      setActiveTenantId(result.activeTenantId)
+    } catch {
+      // Hors-ligne ou session expirée : on conserve l'état courant.
+    }
+  }, [sessionToken])
+
+  /**
+   * Bascule de salon. Le serveur révoque l'ancienne session et renvoie un jeton
+   * porteur du rôle du salon cible : on le stocke **avant** de recharger, sinon
+   * l'application repartirait avec un jeton mort.
+   */
+  const switchTenant = useCallback(
+    async (tenantId: string) => {
+      const switched = await switchActiveTenant(tenantId)
+      const rememberMe = Boolean(
+        (() => {
+          try {
+            return window.localStorage.getItem(AUTH_USER_LOCAL_KEY)
+          } catch {
+            return null
+          }
+        })(),
+      )
+      const nextUser = switched.user as unknown as PublicSalonUser
+      setCurrentUser(nextUser)
+      setSessionToken(switched.sessionToken)
+      persistAuthSession(nextUser, switched.sessionToken, rememberMe, switched.refreshToken)
+      setActiveTenantId(switched.tenantId)
+      // Les données locales (IndexedDB) sont propres à un salon : on recharge
+      // pour repartir d'un état vierge côté affichage.
+      try {
+        window.location.assign('/dashboard')
+      } catch {
+        // Environnement sans navigation (tests) : la bascule reste effective.
+      }
+    },
+    [],
+  )
+
   const logout = useCallback(() => {
     // Révocation immédiate côté serveur (la session ne survit pas à la déconnexion).
     void revokeSessionOnServer()
@@ -402,6 +461,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setCurrentUser(null)
     setSessionToken(null)
   }, [])
+
+  // Liste des salons du compte (sélecteur de salon et écran Équipe).
+  useEffect(() => {
+    // Lancement en microtâche : `refreshTenants` met à jour l'état dès son
+    // premier `setState`, on évite donc un rendu en cascade synchrone.
+    let cancelled = false
+    Promise.resolve().then(() => {
+      if (!cancelled) void refreshTenants()
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [sessionToken, refreshTenants])
 
   // Rotation automatique du jeton d'accès avant expiration (15 min).
   useEffect(() => {
@@ -442,6 +514,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       currentUser,
       localAccounts,
       sessionToken,
+      tenants,
+      activeTenantId,
+      refreshTenants,
+      switchTenant,
       refreshAuthStatus,
       login,
       register,
@@ -454,6 +530,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       currentUser,
       localAccounts,
       sessionToken,
+      tenants,
+      activeTenantId,
+      refreshTenants,
+      switchTenant,
       refreshAuthStatus,
       login,
       register,
